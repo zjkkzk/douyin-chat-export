@@ -60,7 +60,7 @@ class WebChatScraper:
         self.pw = await async_playwright().start()
         self.context = await self.pw.chromium.launch_persistent_context(
             USER_DATA_DIR,
-            headless=False,
+            headless=os.environ.get("HEADLESS", "false").lower() == "true",
             viewport={"width": 1400, "height": 900},
             locale="zh-CN",
             args=["--disable-blink-features=AutomationControlled"],

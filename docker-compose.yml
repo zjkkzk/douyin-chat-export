@@ -1,0 +1,14 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - MODE=all                    # web | scraper | all
+      - HEADLESS=true               # true for Docker (no display)
+      - SCRAPER_INCREMENTAL=true    # incremental by default
+      - SCRAPER_FILTER=             # empty = all conversations
+      - SCRAPER_SCHEDULE=           # cron expr, e.g. "0 */6 * * *" (empty = no schedule)
+    restart: unless-stopped

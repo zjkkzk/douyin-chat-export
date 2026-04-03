@@ -98,6 +98,10 @@ def get_user(uid: str):
     return user
 
 
+# Control panel (must be before catch-all)
+from backend.control_panel import control_router
+app.include_router(control_router)
+
 # Serve Vue frontend (must be last)
 _frontend_dist = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend", "dist")
 if os.path.isdir(_frontend_dist):

@@ -1,0 +1,14 @@
+data/
+venv/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+.DS_Store
+.claude/
+.server.*
+CLAUDE.md
+TECHNICAL.md
+node_modules/
+frontend/node_modules/
+frontend/dist/
