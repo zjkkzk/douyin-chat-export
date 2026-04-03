@@ -7,6 +7,7 @@ import SearchBar from './components/SearchBar.vue'
 const activeConversation = ref(null)
 const searchHighlight = ref('')
 const jumpToSeq = ref(null)
+const sidebarOpen = ref(false)
 
 const themes = [
   { id: 'dark',   label: '深蓝', color: '#1a1a2e' },
@@ -27,6 +28,7 @@ function applyTheme(id) {
 function selectConversation(conv) {
   activeConversation.value = conv
   searchHighlight.value = ''
+  sidebarOpen.value = false
 }
 
 function navigateToMessage(item) {
@@ -41,7 +43,8 @@ function navigateToMessage(item) {
 
 <template>
   <div class="app-layout">
-    <div class="app-sidebar">
+    <div class="sidebar-overlay" :class="{ visible: sidebarOpen }" @click="sidebarOpen = false"></div>
+    <div class="app-sidebar" :class="{ open: sidebarOpen }">
       <ConversationList
         :activeId="activeConversation?.conv_id"
         @select="selectConversation"
@@ -49,6 +52,7 @@ function navigateToMessage(item) {
     </div>
     <div class="app-main">
       <div class="app-toolbar">
+        <button class="sidebar-toggle" @click="sidebarOpen = !sidebarOpen">☰</button>
         <div class="app-title">抖音聊天记录</div>
         <SearchBar @navigate="navigateToMessage" />
         <div class="theme-switcher">
@@ -136,5 +140,84 @@ function navigateToMessage(item) {
 .theme-btn.active {
   border-color: var(--accent);
   transform: scale(1.15);
+}
+
+.sidebar-toggle {
+  display: none;
+  background: none;
+  border: none;
+  color: var(--text-primary);
+  font-size: 22px;
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+.sidebar-toggle:hover {
+  background: var(--bg-tertiary);
+}
+
+.sidebar-overlay {
+  display: none;
+}
+
+@media (max-width: 768px) {
+  .sidebar-toggle {
+    display: block;
+  }
+
+  .app-sidebar {
+    position: fixed;
+    left: 0;
+    top: 0;
+    height: 100vh;
+    z-index: 1000;
+    transform: translateX(-100%);
+    transition: transform 0.25s ease;
+    width: 280px;
+  }
+
+  .app-sidebar.open {
+    transform: translateX(0);
+  }
+
+  .sidebar-overlay {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    z-index: 999;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.25s ease;
+  }
+
+  .sidebar-overlay.visible {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  .app-toolbar {
+    flex-wrap: wrap;
+    padding: 8px 12px;
+    gap: 8px;
+  }
+
+  .app-title {
+    flex: 1;
+    font-size: 14px;
+  }
+
+  .theme-switcher {
+    order: 0;
+    margin-left: 0;
+    gap: 5px;
+  }
+
+  .app-toolbar .search-container {
+    order: 1;
+    flex-basis: 100%;
+    max-width: none;
+  }
 }
 </style>

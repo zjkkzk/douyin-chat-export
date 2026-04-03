@@ -517,19 +517,15 @@ class WebChatScraper:
             title_el = await item.query_selector(SEL_CONV_TITLE)
             if title_el:
                 title_text = (await title_el.inner_text()).strip()
-                if title_text == conv_name:
+                if clean_name in title_text or title_text in conv_name:
                     await item.click()
                     clicked = True
-                    print(f"  [*] 已点击会话: {clean_name}")
+                    print(f"  [*] 已点击会话: {title_text}")
                     break
 
         if not clicked:
-            if conv_index < len(conv_items):
-                await conv_items[conv_index].click()
-                print(f"  [*] 已点击会话 (索引 {conv_index})")
-            else:
-                print(f"  [!] 无法找到会话: {conv_name}")
-                return
+            print(f"  [!] 无法找到会话「{clean_name}」，跳过")
+            return
 
         await asyncio.sleep(2)
 
@@ -574,7 +570,7 @@ class WebChatScraper:
                 try:
                     body = request.post_data_buffer
                     if body:
-                        cursor = await self.page.evaluate("""(bytes) => {
+                        result = await self.page.evaluate("""(bytes) => {
                             function dv(buf, pos) {
                                 let r = 0n, s = 0n;
                                 while (pos < buf.length) {
@@ -594,25 +590,48 @@ class WebChatScraper:
                                 }
                                 return null;
                             }
+                            // 提取字符串字段 (wire type 2)
+                            function efStr(buf, tf) {
+                                let pos = 0;
+                                while (pos < buf.length) {
+                                    let tag; [tag, pos] = dv(buf, pos);
+                                    const fn = Number(tag >> 3n), wt = Number(tag & 7n);
+                                    if (wt === 0) { let v; [v, pos] = dv(buf, pos); }
+                                    else if (wt === 2) {
+                                        let len; [len, pos] = dv(buf, pos); len = Number(len);
+                                        if (fn === tf) return new TextDecoder().decode(buf.slice(pos, pos + len));
+                                        pos += len;
+                                    }
+                                    else if (wt === 1) pos += 8; else if (wt === 5) pos += 4; else break;
+                                }
+                                return null;
+                            }
                             const data = new Uint8Array(bytes);
                             const f8 = ef(data, 8);
                             if (!f8) return null;
                             const f301 = ef(f8, 301);
                             if (!f301) return null;
+                            // 提取 conv_id (field 1, string) 和 cursor (field 3, varint)
+                            const reqConvId = efStr(f301, 1);
+                            let cursor = null;
                             let pos = 0;
                             while (pos < f301.length) {
                                 let tag; [tag, pos] = dv(f301, pos);
                                 const fn = Number(tag >> 3n), wt = Number(tag & 7n);
-                                if (wt === 0) { let v; [v, pos] = dv(f301, pos); if (fn === 3) return v.toString(); }
+                                if (wt === 0) { let v; [v, pos] = dv(f301, pos); if (fn === 3) cursor = v.toString(); }
                                 else if (wt === 2) { let len; [len, pos] = dv(f301, pos); pos += Number(len); }
                                 else if (wt === 1) pos += 8; else if (wt === 5) pos += 4; else break;
                             }
-                            return null;
+                            return { convId: reqConvId, cursor: cursor };
                         }""", list(body))
-                        if cursor and cursor != "0":
-                            self._captured_api_cursor = cursor
-                            print(f"  [*] 捕获到 API cursor: {cursor}")
-                            cursor_captured_event.set()
+                        if result and result.get("cursor") and result["cursor"] != "0":
+                            req_conv_id = result.get("convId", "")
+                            if req_conv_id == conv_id:
+                                self._captured_api_cursor = result["cursor"]
+                                print(f"  [*] 捕获到 API cursor: {result['cursor']} (conv_id 匹配)")
+                                cursor_captured_event.set()
+                            else:
+                                print(f"  [!] 忽略不匹配的 API 请求: conv_id={req_conv_id} (期望 {conv_id})")
                 except Exception:
                     pass
 
@@ -624,23 +643,22 @@ class WebChatScraper:
         await asyncio.sleep(3)
 
         # 4. 重新点击目标会话（触发 SDK 从 API 加载消息）
-        print(f"  [*] 重新点击会话: {conv_name}...")
+        print(f"  [*] 重新点击会话: {clean_name}...")
         clicked = False
         conv_items = await self.page.query_selector_all(SEL_CONV_ITEM)
         for item in conv_items:
             title_el = await item.query_selector(SEL_CONV_TITLE)
             if title_el:
                 title_text = (await title_el.inner_text()).strip()
-                if title_text == conv_name:
+                if clean_name in title_text or title_text in conv_name:
                     await item.click()
                     clicked = True
+                    print(f"  [*] 重新点击会话: {title_text}")
                     break
         if not clicked:
-            print(f"  [!] 重新加载后未找到会话: {conv_name}，尝试回退...")
-            # 直接用索引点击
-            conv_items = await self.page.query_selector_all(SEL_CONV_ITEM)
-            if conv_items:
-                await conv_items[0].click()
+            print(f"  [!] 重新加载后未找到会话「{clean_name}」，跳过 API 模式")
+            self.page.remove_listener("request", capture_api_request)
+            return
 
         # 5. 等待 SDK 发出 API 请求（缓存已清，应该很快）
         print(f"  [*] 等待 SDK 发出 API 请求...")
@@ -1043,6 +1061,17 @@ class WebChatScraper:
                 ref_count = sum(1 for m in msgs if m.get("_ref_msg"))
                 if ref_count:
                     print(f"  [debug] 发现 {ref_count} 条引用/回复消息")
+
+            # 过滤掉不属于目标会话的消息（防止 cursor 错误导致拉到其他会话的数据）
+            filtered_msgs = []
+            for m in msgs:
+                msg_conv_id = m.get("conv_id", "")
+                if msg_conv_id and msg_conv_id != conv_id:
+                    continue
+                filtered_msgs.append(m)
+            if len(filtered_msgs) < len(msgs):
+                print(f"  [!] 过滤掉 {len(msgs) - len(filtered_msgs)} 条不属于当前会话的消息")
+            msgs = filtered_msgs
 
             # 转换 API 消息格式 → _store_messages 期望的格式
             converted = []
