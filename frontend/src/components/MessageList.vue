@@ -727,7 +727,8 @@ watch(() => props.jumpToSeq, async (seq) => {
 .msg-panel {
   display: flex;
   flex-direction: column;
-  height: 100%;
+  flex: 1;
+  min-height: 0;
   background: var(--bg-primary);
   position: relative;
 }
@@ -833,7 +834,7 @@ watch(() => props.jumpToSeq, async (seq) => {
 .msg-list {
   flex: 1;
   overflow-y: auto;
-  padding: 16px 20px;
+  padding: 16px 20px 32px;
 }
 
 .msg-loading, .msg-no-data {

@@ -89,6 +89,7 @@ function navigateToMessage(item) {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  overflow: hidden;
 }
 
 .app-toolbar {
