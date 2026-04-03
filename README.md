@@ -12,8 +12,12 @@
 - **增量更新**：支持增量模式，只获取新消息
 - **前端浏览器**：内置 Vue 3 + FastAPI 聊天记录浏览界面，支持无限滚动、全文搜索、搜索跳转
 - **ChatLab 导出**：支持导出为 [ChatLab](https://github.com/hellodigua/ChatLab) 标准格式（JSON/JSONL），可用于 AI 聊天记录分析
+- **控制面板**：Web 管理面板，可视化控制采集、导出、定时任务，支持远程扫码登录
+- **Docker 部署**：支持 Docker 一键部署，含前端、后端、采集器
 
-## 安装
+## 部署方式
+
+### 方式一：本地运行
 
 ```bash
 # 克隆项目
@@ -28,13 +32,58 @@ source venv/bin/activate
 pip install -r requirements.txt
 playwright install chromium
 
-# 安装前端依赖（如需开发模式）
-cd frontend && npm install && cd ..
+# 安装前端依赖并构建
+cd frontend && npm install && npm run build && cd ..
+
+# 启动服务
+python3 -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
+```
+
+访问 `http://localhost:8000` 查看聊天记录，`http://localhost:8000/panel` 打开控制面板。
+
+### 方式二：Docker 部署
+
+```bash
+git clone https://github.com/TeamBreakerr/douyin-chat-export.git
+cd douyin-chat-export
+docker compose up -d --build
+```
+
+默认配置已包含前端构建、后端服务、Playwright 浏览器环境。数据持久化在 `./data` 目录。
+
+#### 环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `MODE` | `all` | `web` 只启动 Web 服务 / `scraper` 只执行采集 / `all` 全部启动 |
+| `HEADLESS` | `true` | 浏览器是否无头模式（Docker 中必须为 true） |
+| `SCRAPER_INCREMENTAL` | `true` | 采集是否增量模式 |
+| `SCRAPER_FILTER` | (空) | 过滤指定会话名称 |
+| `SCRAPER_SCHEDULE` | (空) | cron 表达式，如 `0 */6 * * *`（空=不定时） |
+
+#### 反向代理（可选）
+
+`docker-compose.yml` 默认不映射端口，通过 Docker 网络 `web-internal` 与反向代理（如 Nginx Proxy Manager）配合使用。如需直接访问，添加端口映射：
+
+```yaml
+services:
+  douyin-chat-export:
+    ports:
+      - "8000:8000"
 ```
 
 ## 使用
 
-### 1. 导出聊天记录
+### 1. 登录
+
+首次使用需要扫码登录抖音：
+
+- **本地运行**：首次执行 `extract.py` 会自动打开浏览器窗口
+- **Docker 部署**：打开控制面板 `/panel`，点击 Scan QR Login，通过截图远程扫码
+
+登录状态保存在 `data/browser_profile/`。
+
+### 2. 导出聊天记录
 
 ```bash
 # 全量导出所有会话
@@ -47,19 +96,7 @@ python3 extract.py --filter "会话名称"
 python3 extract.py --filter "会话名称" --incremental
 ```
 
-首次运行会打开 Chromium 浏览器，需要手动扫码登录抖音。登录状态会保存在 `data/browser_profile/` 中。
-
-### 2. 浏览聊天记录
-
-```bash
-# 一键启动（后端 API + 前端静态文件）
-./start.sh
-
-# 或手动启动
-python3 -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
-```
-
-访问 `http://localhost:8000` 查看聊天记录。
+也可在控制面板 `/panel` 中可视化操作。
 
 ### 3. 导出为 ChatLab 格式
 
@@ -77,6 +114,17 @@ python3 export.py --filter "会话名称" --output data/export.jsonl
 ```
 
 导出内容包括：文本、表情、图片 URL、语音（base64 嵌入）、分享链接、引用/回复关系。
+
+### 4. 控制面板
+
+访问 `/panel` 可使用 Web 控制面板：
+
+- **状态概览**：会话数、消息数、用户数
+- **登录管理**：远程扫码登录、检查登录状态、清除会话
+- **采集控制**：增量/全量切换、会话过滤（支持自定义输入）、实时日志
+- **定时任务**：标准 cron 表达式、预设快捷按钮
+- **导出管理**：选择格式和会话、一键导出下载
+- **主题切换**：Dark / Light / Ocean / Purple 四种主题
 
 ## 注意事项
 
