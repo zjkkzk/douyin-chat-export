@@ -16,7 +16,7 @@
 
 ```bash
 # 克隆项目
-git clone https://github.com/你的用户名/douyin-chat-export.git
+git clone https://github.com/TeamBreakerr/douyin-chat-export.git
 cd douyin-chat-export
 
 # 创建虚拟环境
