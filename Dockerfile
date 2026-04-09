@@ -2,7 +2,7 @@
 FROM node:22-alpine AS frontend-builder
 WORKDIR /app/frontend
 COPY frontend/package.json frontend/package-lock.json ./
-RUN npm ci
+RUN npm ci --network-timeout=120000 || npm ci --registry=https://registry.npmmirror.com --network-timeout=120000
 COPY frontend/index.html frontend/vite.config.js frontend/jsconfig.json ./
 COPY frontend/src/ src/
 COPY frontend/public/ public/

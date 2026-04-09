@@ -6,8 +6,14 @@ import hashlib
 import os
 import re
 import random
+import sys
 import time
 from datetime import datetime, timedelta
+
+# Fix Windows console encoding for CJK + special chars (e.g. \xa0)
+if sys.stdout.encoding and sys.stdout.encoding.lower() in ('gbk', 'gb2312', 'cp936'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 from playwright.async_api import async_playwright
 
@@ -350,6 +356,11 @@ class WebChatScraper:
             }}""")
             await asyncio.sleep(1)
 
+        # Normalize special whitespace (e.g. \xa0) in conversation names
+        for c in all_convs:
+            c["name"] = c["name"].replace('\xa0', ' ').strip()
+            c["nickname"] = c.get("nickname", "").replace('\xa0', ' ').strip()
+
         return all_convs
 
     async def _download_voice_files(self, messages):
@@ -518,8 +529,8 @@ class WebChatScraper:
         for item in conv_items:
             title_el = await item.query_selector(SEL_CONV_TITLE)
             if title_el:
-                title_text = (await title_el.inner_text()).strip()
-                if clean_name in title_text or title_text in conv_name:
+                title_text = (await title_el.inner_text()).strip().replace('\xa0', ' ')
+                if clean_name in title_text or title_text in clean_name:
                     await item.click()
                     clicked = True
                     print(f"  [*] 已点击会话: {title_text}")
@@ -642,7 +653,12 @@ class WebChatScraper:
         # 3. 重新加载聊天页面（SDK 内存缓存随页面销毁而清除）
         print(f"  [*] 重新加载聊天页面...")
         await self.page.goto(CHAT_URL, wait_until="domcontentloaded")
-        await asyncio.sleep(3)
+        # 等待会话列表加载
+        try:
+            await self.page.wait_for_selector(SEL_CONV_ITEM, timeout=15000)
+        except Exception:
+            pass
+        await asyncio.sleep(2)
 
         # 4. 重新点击目标会话（触发 SDK 从 API 加载消息）
         print(f"  [*] 重新点击会话: {clean_name}...")
@@ -651,8 +667,8 @@ class WebChatScraper:
         for item in conv_items:
             title_el = await item.query_selector(SEL_CONV_TITLE)
             if title_el:
-                title_text = (await title_el.inner_text()).strip()
-                if clean_name in title_text or title_text in conv_name:
+                title_text = (await title_el.inner_text()).strip().replace('\xa0', ' ')
+                if clean_name in title_text or title_text in clean_name:
                     await item.click()
                     clicked = True
                     print(f"  [*] 重新点击会话: {title_text}")
