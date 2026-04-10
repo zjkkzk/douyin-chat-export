@@ -26,14 +26,18 @@ cd douyin-chat-export
 
 # 创建虚拟环境
 python3 -m venv venv
-source venv/bin/activate
+source venv/bin/activate          # macOS / Linux
+# venv\Scripts\activate           # Windows PowerShell
 
 # 安装 Python 依赖
 pip install -r requirements.txt
 playwright install chromium
 
 # 安装前端依赖并构建
-cd frontend && npm install && npm run build && cd ..
+cd frontend
+npm install
+npm run build
+cd ..
 
 # 启动服务
 python3 -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
