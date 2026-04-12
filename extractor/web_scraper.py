@@ -387,24 +387,27 @@ class WebChatScraper:
         return count
 
     async def _find_and_click_conversation(self, target_name):
-        """Find and click a conversation by name using JS-based matching.
+        """Find a conversation by name and click it.
 
-        Tries matching in the currently rendered DOM first. If not found
-        (Douyin uses virtual scrolling, so some items may be off-screen),
-        scrolls down incrementally and retries.
+        JS does the matching (with whitespace/nbsp normalization, so Windows
+        vs. Linux discrepancies don't break `in` checks), but the ACTUAL
+        click uses Playwright's element handle — JS `.click()` only fires a
+        `click` event, while React listens for `pointerdown`/`mousedown`,
+        so a JS click was identified but wouldn't activate the conversation.
         """
         async def _try_match():
-            return await self.page.evaluate(f"""(targetName) => {{
+            """Return (matched_index, matched_text, debug_names) or (-1, '', names)."""
+            result = await self.page.evaluate(f"""(targetName) => {{
                 const normalize = s => s.replace(/[\\s\\u00a0]+/g, ' ').trim();
                 const target = normalize(targetName);
                 const items = document.querySelectorAll('{SEL_CONV_ITEM}');
                 const debugNames = [];
 
-                for (const item of items) {{
+                for (let i = 0; i < items.length; i++) {{
+                    const item = items[i];
                     const titleEl = item.querySelector('{SEL_CONV_TITLE}');
-                    if (!titleEl) continue;
+                    if (!titleEl) {{ debugNames.push(''); continue; }}
 
-                    // Extract pure nickname (inner title div or first text node)
                     const innerTitle = titleEl.querySelector('{SEL_CONV_TITLE}');
                     let nickname = '';
                     if (innerTitle) {{
@@ -419,25 +422,33 @@ class WebChatScraper:
                     const fullText = normalize(titleEl.textContent);
                     debugNames.push(nickname || fullText.substring(0, 20));
 
-                    // Match: exact, substring (either direction), full text
                     if (nickname === target ||
                         (nickname && target.includes(nickname)) ||
                         (nickname && nickname.includes(target)) ||
                         fullText.includes(target)) {{
-                        item.click();
-                        return {{found: true, text: nickname || fullText}};
+                        return {{index: i, text: nickname || fullText, names: debugNames}};
                     }}
                 }}
 
-                return {{found: false, count: items.length, names: debugNames}};
+                return {{index: -1, text: '', names: debugNames}};
             }}""", target_name)
-
-        # First attempt: match current DOM (don't disturb scroll state)
-        result = await _try_match()
-        if result.get("found"):
             return result
 
-        all_debug_names = list(result.get("names", []))
+        async def _click_index(idx, text):
+            items = await self.page.query_selector_all(SEL_CONV_ITEM)
+            if idx < len(items):
+                await items[idx].click()
+                return {"found": True, "text": text}
+            return None
+
+        # First attempt: match current DOM (don't disturb scroll state)
+        m = await _try_match()
+        if m["index"] >= 0:
+            clicked = await _click_index(m["index"], m["text"])
+            if clicked:
+                return clicked
+
+        all_debug_names = list(m.get("names", []))
 
         # Not found in current view; scroll from top, incrementally.
         await self.page.evaluate(f"""() => {{
@@ -450,12 +461,14 @@ class WebChatScraper:
         await asyncio.sleep(0.5)
 
         for _ in range(20):
-            result = await _try_match()
-            if result.get("found"):
-                return result
+            m = await _try_match()
+            if m["index"] >= 0:
+                clicked = await _click_index(m["index"], m["text"])
+                if clicked:
+                    return clicked
 
-            for n in result.get("names", []):
-                if n not in all_debug_names:
+            for n in m.get("names", []):
+                if n and n not in all_debug_names:
                     all_debug_names.append(n)
 
             reached_bottom = await self.page.evaluate(f"""() => {{
