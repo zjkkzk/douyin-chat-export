@@ -32,11 +32,28 @@
         <button
           class="conv-delete"
           title="删除该会话数据"
-          @click.stop="deleteConversation(conv)"
+          @click.stop="requestDelete(conv)"
         >×</button>
       </div>
       <div v-if="conversations.length === 0" class="conv-empty">
         暂无会话数据
+      </div>
+    </div>
+
+    <!-- Custom confirm modal -->
+    <div v-if="pendingDelete" class="modal-backdrop" @click.self="cancelDelete">
+      <div class="modal-box">
+        <div class="modal-title">删除会话</div>
+        <div class="modal-body">
+          确定删除会话「<strong>{{ pendingDelete.name || '未命名' }}</strong>」的所有数据？
+          <div class="modal-sub">共 {{ pendingDelete.message_count || 0 }} 条消息，此操作不可恢复。</div>
+        </div>
+        <div class="modal-actions">
+          <button class="btn btn-cancel" @click="cancelDelete" :disabled="deleting">取消</button>
+          <button class="btn btn-danger" @click="confirmDelete" :disabled="deleting">
+            {{ deleting ? '删除中...' : '删除' }}
+          </button>
+        </div>
       </div>
     </div>
   </div>
@@ -54,6 +71,8 @@ const conversations = ref([])
 const total = ref(0)
 const searchQuery = ref('')
 const usersMap = reactive({})  // uid -> { nickname, avatar_url }
+const pendingDelete = ref(null)
+const deleting = ref(false)
 let searchTimeout = null
 
 async function fetchUsers() {
@@ -106,22 +125,37 @@ function onSearch() {
   }, 300)
 }
 
-async function deleteConversation(conv) {
-  const name = conv.name || '未命名'
-  if (!confirm(`确定删除会话「${name}」的所有数据？此操作不可恢复。`)) return
+function requestDelete(conv) {
+  pendingDelete.value = conv
+}
+
+function cancelDelete() {
+  if (deleting.value) return
+  pendingDelete.value = null
+}
+
+async function confirmDelete() {
+  const conv = pendingDelete.value
+  if (!conv) return
+  deleting.value = true
   try {
-    const res = await fetch(`/api/conversations/${encodeURIComponent(conv.conv_id)}`, {
-      method: 'DELETE',
+    // Use POST alias to avoid reverse proxies that block DELETE
+    const res = await fetch(`/api/conversations/${encodeURIComponent(conv.conv_id)}/delete`, {
+      method: 'POST',
     })
     if (!res.ok) {
-      alert(`删除失败：${res.status}`)
+      const body = await res.text().catch(() => '')
+      alert(`删除失败：${res.status} ${body}`)
       return
     }
     conversations.value = conversations.value.filter(c => c.conv_id !== conv.conv_id)
     total.value = Math.max(0, total.value - 1)
     emit('deleted', conv.conv_id)
+    pendingDelete.value = null
   } catch (e) {
     alert(`删除失败：${e.message || e}`)
+  } finally {
+    deleting.value = false
   }
 }
 
@@ -271,5 +305,94 @@ onMounted(async () => {
   text-align: center;
   color: var(--text-muted);
   font-size: 14px;
+}
+
+/* Confirm modal */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 2000;
+  animation: fadeIn 0.15s ease;
+}
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.modal-box {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 12px;
+  min-width: 320px;
+  max-width: 90vw;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.4);
+  overflow: hidden;
+  animation: popIn 0.18s ease;
+}
+@keyframes popIn {
+  from { transform: scale(0.92); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+
+.modal-title {
+  padding: 16px 20px;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.modal-body {
+  padding: 20px;
+  font-size: 14px;
+  color: var(--text-primary);
+  line-height: 1.6;
+}
+.modal-body strong {
+  color: var(--accent);
+  word-break: break-all;
+}
+.modal-sub {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.modal-actions {
+  display: flex;
+  gap: 10px;
+  padding: 12px 20px 18px;
+  justify-content: flex-end;
+}
+.btn {
+  padding: 8px 18px;
+  border: none;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: filter 0.15s, background 0.15s;
+}
+.btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.btn-cancel {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+.btn-cancel:hover:not(:disabled) {
+  filter: brightness(1.15);
+}
+.btn-danger {
+  background: #e53935;
+  color: #fff;
+}
+.btn-danger:hover:not(:disabled) {
+  background: #c62828;
 }
 </style>

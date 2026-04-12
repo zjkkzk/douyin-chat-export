@@ -141,12 +141,22 @@ def get_conversation(conv_id: str):
     return conv
 
 
-@app.delete("/api/conversations/{conv_id}")
-def delete_conversation(conv_id: str):
+def _do_delete_conversation(conv_id: str):
     conv = database.get_conversation(conv_id)
     if not conv:
         raise HTTPException(404, "会话不存在")
     return database.delete_conversation(conv_id)
+
+
+@app.delete("/api/conversations/{conv_id}")
+def delete_conversation(conv_id: str):
+    return _do_delete_conversation(conv_id)
+
+
+# POST alias for proxies that block DELETE method
+@app.post("/api/conversations/{conv_id}/delete")
+def delete_conversation_post(conv_id: str):
+    return _do_delete_conversation(conv_id)
 
 
 @app.get("/api/conversations/{conv_id}/messages")
