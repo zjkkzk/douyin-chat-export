@@ -4,11 +4,6 @@ import subprocess
 import sys
 import os
 
-# On Windows, re-launch in UTF-8 mode if not already set.
-if sys.platform == 'win32' and os.environ.get('PYTHONUTF8') != '1':
-    os.environ['PYTHONUTF8'] = '1'
-    sys.exit(subprocess.call([sys.executable, '-X', 'utf8'] + sys.argv))
-
 sys.path.insert(0, os.path.dirname(__file__))
 
 from extractor.models import init_db

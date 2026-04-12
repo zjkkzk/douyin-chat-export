@@ -10,9 +10,8 @@ import sys
 import time
 from datetime import datetime, timedelta
 
-# Fix Windows console encoding: add error handling so unencodable chars
-# (e.g. \xa0) don't crash the script. The entry point (extract.py) handles
-# UTF-8 mode via PYTHONUTF8; this is a fallback for direct imports.
+# Fix Windows console encoding: allow unencodable chars (e.g. \xa0, emoji,
+# decorative Unicode in nicknames) to be replaced instead of crashing print().
 if sys.platform == 'win32':
     for _stream in (sys.stdout, sys.stderr):
         if hasattr(_stream, 'reconfigure'):
@@ -370,77 +369,114 @@ class WebChatScraper:
         return all_convs
 
     async def _ensure_conv_list_loaded(self):
-        """Wait for conversation list to load and scroll to include all items."""
+        """Wait for conversation list to load, then ensure scroll is at top.
+
+        Douyin uses virtual scrolling: off-screen items are removed from DOM.
+        We scroll to top so _find_and_click_conversation can see the most
+        recent conversations (which is the order extract_all iterates in).
+        """
         try:
             await self.page.wait_for_selector(SEL_CONV_ITEM, timeout=20000)
         except Exception:
             return 0
         await asyncio.sleep(1)
 
-        prev_count = 0
-        stable_rounds = 0
-        for _ in range(20):
-            count = await self.page.evaluate(f"""() =>
-                document.querySelectorAll('{SEL_CONV_ITEM}').length
-            """)
-            if count <= prev_count:
-                stable_rounds += 1
-                if stable_rounds >= 2:
-                    break
-            else:
-                stable_rounds = 0
-            prev_count = count
-            await self.page.evaluate(f"""() => {{
-                const list = document.querySelector('{SEL_CONV_LIST}');
-                if (list) {{
-                    const scrollable = list.querySelector('[style*="overflow"]') || list;
-                    scrollable.scrollTop += 500;
-                }}
-            }}""")
-            await asyncio.sleep(0.5)
+        # Scroll to top so the most recent conversations are in DOM
+        await self.page.evaluate(f"""() => {{
+            const list = document.querySelector('{SEL_CONV_LIST}');
+            if (list) {{
+                const scrollable = list.querySelector('[style*="overflow"]') || list;
+                scrollable.scrollTop = 0;
+            }}
+        }}""")
+        await asyncio.sleep(0.5)
 
-        return prev_count
+        count = await self.page.evaluate(f"""() =>
+            document.querySelectorAll('{SEL_CONV_ITEM}').length
+        """)
+        return count
 
     async def _find_and_click_conversation(self, target_name):
-        """Find and click a conversation by name using JS-based matching."""
-        result = await self.page.evaluate(f"""(targetName) => {{
-            const normalize = s => s.replace(/[\\s\\u00a0]+/g, ' ').trim();
-            const target = normalize(targetName);
-            const items = document.querySelectorAll('{SEL_CONV_ITEM}');
-            const debugNames = [];
+        """Find and click a conversation by name using JS-based matching.
 
-            for (const item of items) {{
-                const titleEl = item.querySelector('{SEL_CONV_TITLE}');
-                if (!titleEl) continue;
+        Douyin uses virtual scrolling, so not all items are in DOM at once.
+        We scroll top→bottom, trying to match on each step.
+        """
+        # Reset scroll to top first
+        await self.page.evaluate(f"""() => {{
+            const list = document.querySelector('{SEL_CONV_LIST}');
+            if (list) {{
+                const scrollable = list.querySelector('[style*="overflow"]') || list;
+                scrollable.scrollTop = 0;
+            }}
+        }}""")
+        await asyncio.sleep(0.3)
 
-                // Extract pure nickname (inner title div or first text node)
-                const innerTitle = titleEl.querySelector('{SEL_CONV_TITLE}');
-                let nickname = '';
-                if (innerTitle) {{
-                    nickname = normalize(innerTitle.textContent);
-                }} else {{
-                    for (const node of titleEl.childNodes) {{
-                        const t = node.textContent?.trim();
-                        if (t) {{ nickname = normalize(t); break; }}
+        all_debug_names = []
+        max_scrolls = 20
+
+        for scroll_idx in range(max_scrolls):
+            result = await self.page.evaluate(f"""(targetName) => {{
+                const normalize = s => s.replace(/[\\s\\u00a0]+/g, ' ').trim();
+                const target = normalize(targetName);
+                const items = document.querySelectorAll('{SEL_CONV_ITEM}');
+                const debugNames = [];
+
+                for (const item of items) {{
+                    const titleEl = item.querySelector('{SEL_CONV_TITLE}');
+                    if (!titleEl) continue;
+
+                    // Extract pure nickname (inner title div or first text node)
+                    const innerTitle = titleEl.querySelector('{SEL_CONV_TITLE}');
+                    let nickname = '';
+                    if (innerTitle) {{
+                        nickname = normalize(innerTitle.textContent);
+                    }} else {{
+                        for (const node of titleEl.childNodes) {{
+                            const t = node.textContent?.trim();
+                            if (t) {{ nickname = normalize(t); break; }}
+                        }}
+                    }}
+
+                    const fullText = normalize(titleEl.textContent);
+                    debugNames.push(nickname || fullText.substring(0, 20));
+
+                    // Match: exact, substring (either direction), full text
+                    if (nickname === target ||
+                        (nickname && target.includes(nickname)) ||
+                        (nickname && nickname.includes(target)) ||
+                        fullText.includes(target)) {{
+                        item.click();
+                        return {{found: true, text: nickname || fullText}};
                     }}
                 }}
 
-                const fullText = normalize(titleEl.textContent);
-                debugNames.push(nickname || fullText.substring(0, 20));
+                return {{found: false, count: items.length, names: debugNames}};
+            }}""", target_name)
 
-                // Match: exact, substring (either direction), full text
-                if (nickname === target ||
-                    (nickname && target.includes(nickname)) ||
-                    (nickname && nickname.includes(target)) ||
-                    fullText.includes(target)) {{
-                    item.click();
-                    return {{found: true, text: nickname || fullText}};
-                }}
-            }}
+            if result.get("found"):
+                return result
 
-            return {{found: false, count: items.length, names: debugNames.slice(0, 10)}};
-        }}""", target_name)
-        return result
+            # Accumulate unique debug names across scrolls
+            for n in result.get("names", []):
+                if n not in all_debug_names:
+                    all_debug_names.append(n)
+
+            # Scroll down; check if we reached bottom
+            reached_bottom = await self.page.evaluate(f"""() => {{
+                const list = document.querySelector('{SEL_CONV_LIST}');
+                if (!list) return true;
+                const scrollable = list.querySelector('[style*="overflow"]') || list;
+                const before = scrollable.scrollTop;
+                scrollable.scrollTop += 400;
+                return scrollable.scrollTop === before;
+            }}""")
+            await asyncio.sleep(0.4)
+
+            if reached_bottom:
+                break
+
+        return {"found": False, "count": len(all_debug_names), "names": all_debug_names[:20]}
 
     async def _download_voice_files(self, messages):
         """下载语音消息的音频文件到本地"""
