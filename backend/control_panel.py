@@ -1601,10 +1601,12 @@ function setLang(l) {
   lang = l;
   localStorage.setItem('panel-lang', l);
   applyI18n();
-  // Re-render dynamic texts (counts, meta, etc.)
+  // Re-render dynamic texts (counts, meta, lists, etc.)
   renderDiscoverMeta();
   renderConvCounts();
-  refreshStatusLabels();
+  renderAllConvLists();
+  // Refresh composed strings (scrapeTime, scheduleMeta) that are built from t() calls
+  loadStatus();
 }
 
 /* ── Theme ── */
@@ -1681,26 +1683,24 @@ async function loadStatus() {
   } catch (e) { console.error('Status fetch failed:', e); }
 }
 
-function setStatusEl(el, status) {
+// Set both textContent AND data-i18n so future applyI18n() passes stay in sync
+function setText(el, key) {
   if (!el) return;
-  el.textContent = t(status) || status;
-  el.className = 'status status-' + status;
+  el.textContent = t(key);
+  el.setAttribute('data-i18n', key);
 }
 
-function refreshStatusLabels() {
-  // Re-apply current status text (used after language switch)
-  const scrapeStatus = document.getElementById('scrapeStatus');
-  if (scrapeStatus) {
-    const cur = [...scrapeStatus.classList].find(c => c.startsWith('status-') && c !== 'status');
-    if (cur) setStatusEl(scrapeStatus, cur.replace('status-', ''));
-  }
-  const exportStatus = document.getElementById('exportStatus');
-  if (exportStatus) {
-    const cur = [...exportStatus.classList].find(c => c.startsWith('status-') && c !== 'status');
-    if (cur) setStatusEl(exportStatus, cur.replace('status-', ''));
-  }
-  const discoverEl = document.getElementById('discoverStatus');
-  if (discoverEl) setStatusEl(discoverEl, lastDiscoverStatus);
+// Set dynamic (non-keyed) text — clear data-i18n so applyI18n() won't clobber it
+function setDynText(el, text) {
+  if (!el) return;
+  el.textContent = text || '';
+  el.removeAttribute('data-i18n');
+}
+
+function setStatusEl(el, status) {
+  if (!el) return;
+  setText(el, status);
+  el.className = 'status status-' + status;
 }
 
 /* ── Conversation discovery / checkbox lists ── */
@@ -1928,17 +1928,17 @@ async function startExport() {
 async function loadPasswordStatus() {
   const r = await fetch('/panel/api/password/status');
   const d = await r.json();
-  document.getElementById('pwStatus').textContent = d.has_password ? t('passwordIsSet') : t('noPasswordSet');
+  setText(document.getElementById('pwStatus'), d.has_password ? 'passwordIsSet' : 'noPasswordSet');
 }
 async function setPassword() {
   const pw = document.getElementById('pwInput').value;
-  if (!pw) { document.getElementById('pwStatus').textContent = t('passwordEmpty'); return; }
+  if (!pw) { setText(document.getElementById('pwStatus'), 'passwordEmpty'); return; }
   const r = await fetch('/panel/api/password', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({ password: pw }),
   });
   const d = await r.json();
-  document.getElementById('pwStatus').textContent = d.message;
+  setDynText(document.getElementById('pwStatus'), d.message);
   document.getElementById('pwInput').value = '';
 }
 async function clearPassword() {
@@ -1947,7 +1947,7 @@ async function clearPassword() {
     body: JSON.stringify({ password: '' }),
   });
   const d = await r.json();
-  document.getElementById('pwStatus').textContent = d.message;
+  setDynText(document.getElementById('pwStatus'), d.message);
 }
 
 /* ── Login ── */
@@ -1956,24 +1956,24 @@ let loginPollTimer = null;
 async function checkLogin() {
   const ls = document.getElementById('loginStatus');
   const info = document.getElementById('loginInfo');
-  ls.textContent = t('checking'); ls.className = 'status status-running';
+  setText(ls, 'checking'); ls.className = 'status status-running';
   try {
     const r = await fetch('/panel/api/login/check');
     const d = await r.json();
     if (d.status === 'logged_in') {
-      ls.textContent = t('completed'); ls.className = 'status status-completed';
-      info.textContent = t('loginActive');
+      setText(ls, 'completed'); ls.className = 'status status-completed';
+      setText(info, 'loginActive');
     } else if (d.status === 'expired') {
-      ls.textContent = t('failed'); ls.className = 'status status-failed';
-      info.textContent = t('loginExpired');
+      setText(ls, 'failed'); ls.className = 'status status-failed';
+      setText(info, 'loginExpired');
     } else if (d.status === 'no_profile') {
-      ls.textContent = t('failed'); ls.className = 'status status-failed';
-      info.textContent = t('loginNoProfile');
+      setText(ls, 'failed'); ls.className = 'status status-failed';
+      setText(info, 'loginNoProfile');
     } else {
-      ls.textContent = d.status; ls.className = 'status status-idle';
-      info.textContent = d.message || '';
+      setDynText(ls, d.status); ls.className = 'status status-idle';
+      setDynText(info, d.message || '');
     }
-  } catch { ls.textContent = t('error'); ls.className = 'status status-failed'; }
+  } catch { setText(ls, 'error'); ls.className = 'status status-failed'; }
 }
 
 async function startLogin() {
@@ -2004,23 +2004,23 @@ async function pollLoginStatus() {
     const info = document.getElementById('loginInfo');
 
     if (d.status === 'waiting_scan') {
-      ls.textContent = t('waitingScan'); ls.className = 'status status-running';
-      info.textContent = d.message || '';
+      setText(ls, 'waitingScan'); ls.className = 'status status-running';
+      setDynText(info, d.message || '');
       if (d.screenshot) {
         document.getElementById('loginImg').src = 'data:image/png;base64,' + d.screenshot;
         document.getElementById('loginScreenshot').style.display = '';
       }
     } else if (d.status === 'logged_in') {
-      ls.textContent = t('completed'); ls.className = 'status status-completed';
-      info.textContent = d.message;
+      setText(ls, 'completed'); ls.className = 'status status-completed';
+      setDynText(info, d.message);
       finishLogin();
     } else if (d.status === 'failed') {
-      ls.textContent = t('failed'); ls.className = 'status status-failed';
-      info.textContent = d.message;
+      setText(ls, 'failed'); ls.className = 'status status-failed';
+      setDynText(info, d.message);
       finishLogin();
     } else if (d.status === 'starting') {
-      ls.textContent = t('startingLogin'); ls.className = 'status status-running';
-      info.textContent = d.message;
+      setText(ls, 'startingLogin'); ls.className = 'status status-running';
+      setDynText(info, d.message);
     }
   } catch {}
 }
@@ -2104,8 +2104,8 @@ async function clearLogin() {
   if (!confirm(t('clearLoginConfirm'))) return;
   await fetch('/panel/api/login/clear', { method: 'POST' });
   const ls = document.getElementById('loginStatus');
-  ls.textContent = t('idle'); ls.className = 'status status-idle';
-  document.getElementById('loginInfo').textContent = t('sessionCleared');
+  setText(ls, 'idle'); ls.className = 'status status-idle';
+  setText(document.getElementById('loginInfo'), 'sessionCleared');
 }
 
 /* ── Panel Auth ── */
