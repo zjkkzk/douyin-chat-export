@@ -80,12 +80,35 @@ services:
 
 ### 1. 登录
 
-首次使用需要扫码登录抖音：
+首次使用需要登录抖音，支持以下方式：
 
-- **本地运行**：首次执行 `extract.py` 会自动打开浏览器窗口
-- **Docker 部署**：打开控制面板 `/panel`，点击 Scan QR Login，通过截图远程扫码
+#### 方式 A：本地浏览器扫码（推荐 Docker 用户）
 
-登录状态保存在 `data/browser_profile/`。
+在宿主机运行脚本，弹出真实浏览器窗口扫码，登录态通过 volume 映射自动同步到容器：
+
+```bash
+# 需先安装 Playwright：pip install playwright && playwright install chromium
+python3 login.py
+```
+
+扫码成功后浏览器自动关闭。如检测到 Docker 容器，会自动重启服务使登录生效。
+
+#### 方式 B：Cookie 导入
+
+适合无法在宿主机安装 Playwright 的情况。在任意浏览器中登录抖音后导出 Cookie：
+
+1. 打开 `douyin.com` 并登录
+2. 按 `F12` → **Application** → **Cookies** → `https://www.douyin.com`
+3. 右键 Cookie 表格空白处 → **Copy all cookies**
+4. 打开控制面板 `/panel`，点击 **导入 Cookie**，粘贴后点导入
+
+支持 JSON 数组格式（DevTools Copy all cookies）和 `key=value; key=value` 字符串格式（`document.cookie`）。
+
+#### 方式 C：控制面板远程扫码
+
+打开控制面板 `/panel`，点击"扫码登录"，通过截图远程操作容器内的浏览器。适合临时使用，但延迟较高。
+
+登录状态保存在 `data/browser_profile/`，通过 volume 挂载持久化。
 
 ### 2. 导出聊天记录
 

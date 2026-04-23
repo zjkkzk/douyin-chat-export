@@ -114,6 +114,10 @@ class CustomFilterAction(BaseModel):
     value: str
 
 
+class CookieImportRequest(BaseModel):
+    cookies: str  # JSON array from DevTools or "key=value; key=value" string
+
+
 class PasswordRequest(BaseModel):
     password: str = ""  # empty = remove password
 
@@ -807,6 +811,92 @@ async def login_clear():
     return {"status": "cleared"}
 
 
+@control_router.post("/api/login/cookie-import")
+async def login_cookie_import(req: CookieImportRequest):
+    """Import cookies from browser DevTools or document.cookie string."""
+    if _scrape_state["status"] == "running":
+        return JSONResponse({"error": "采集进行中，请先停止"}, status_code=409)
+    if _login_state["status"] in ("starting", "waiting_scan"):
+        return JSONResponse({"error": "登录流程进行中，请先取消"}, status_code=409)
+
+    raw = req.cookies.strip()
+    if not raw:
+        return JSONResponse({"error": "Cookie 数据为空"}, status_code=400)
+
+    parsed: list[dict] = []
+    try:
+        data = json.loads(raw)
+        if isinstance(data, list):
+            for c in data:
+                if not isinstance(c, dict) or "name" not in c:
+                    continue
+                entry: dict = {
+                    "name": c["name"],
+                    "value": str(c.get("value", "")),
+                    "domain": c.get("domain", ".douyin.com"),
+                    "path": c.get("path", "/"),
+                }
+                exp = c.get("expirationDate") or c.get("expires")
+                if exp:
+                    entry["expires"] = float(exp)
+                if c.get("httpOnly") is not None:
+                    entry["httpOnly"] = bool(c["httpOnly"])
+                if c.get("secure") is not None:
+                    entry["secure"] = bool(c["secure"])
+                ss = c.get("sameSite")
+                if ss:
+                    ss_cap = ss.capitalize()
+                    entry["sameSite"] = ss_cap if ss_cap in ("Strict", "Lax", "None") else "Lax"
+                parsed.append(entry)
+        else:
+            return JSONResponse({"error": "JSON 格式需为数组"}, status_code=400)
+    except (json.JSONDecodeError, ValueError):
+        for pair in raw.split(";"):
+            pair = pair.strip()
+            if "=" not in pair:
+                continue
+            name, value = pair.split("=", 1)
+            parsed.append({
+                "name": name.strip(),
+                "value": value.strip(),
+                "domain": ".douyin.com",
+                "path": "/",
+            })
+
+    if not parsed:
+        return JSONResponse({"error": "未能解析出任何 Cookie"}, status_code=400)
+    if not any(c["name"] == "sessionid" for c in parsed):
+        return JSONResponse(
+            {"error": "Cookie 中未包含 sessionid，请确保已登录后再导出"},
+            status_code=400,
+        )
+
+    try:
+        from playwright.async_api import async_playwright
+        os.makedirs(_USER_DATA_DIR, exist_ok=True)
+        pw = await async_playwright().start()
+        ctx = await pw.chromium.launch_persistent_context(
+            _USER_DATA_DIR,
+            headless=True,
+            viewport={"width": 1400, "height": 900},
+            locale="zh-CN",
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        await page.goto("https://www.douyin.com/", wait_until="domcontentloaded")
+        await asyncio.sleep(1)
+        await ctx.add_cookies(parsed)
+        cookies = await ctx.cookies("https://www.douyin.com")
+        ok = "sessionid" in {c["name"] for c in cookies}
+        await ctx.close()
+        await pw.stop()
+        if ok:
+            return {"status": "ok", "message": f"成功导入 {len(parsed)} 个 Cookie", "count": len(parsed)}
+        return JSONResponse({"error": "Cookie 导入后验证失败"}, status_code=400)
+    except Exception as e:
+        return JSONResponse({"error": f"导入失败: {e}"}, status_code=500)
+
+
 async def _login_cleanup():
     try:
         if _login_state["_context"]:
@@ -1157,6 +1247,35 @@ select:focus, input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px v
 }
 .chip .remove:hover { opacity: 1; color: var(--red); }
 
+/* ── Cookie import ── */
+.cookie-import-area {
+  display: none; margin-top: 14px; padding: 16px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+}
+.cookie-import-area.show { display: block; }
+.cookie-import-area textarea {
+  width: 100%; min-height: 100px; background: var(--bg3);
+  border: 1px solid var(--border); color: var(--text);
+  padding: 10px 12px; border-radius: 8px;
+  font-family: 'SF Mono','Cascadia Code','Consolas',monospace;
+  font-size: 12px; line-height: 1.5; resize: vertical;
+  outline: none; box-sizing: border-box;
+}
+.cookie-import-area textarea:focus {
+  border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-bg);
+}
+.cookie-import-hint {
+  font-size: 12px; color: var(--text3); line-height: 1.7; margin-bottom: 10px;
+}
+.cookie-import-hint ol { padding-left: 18px; margin: 6px 0; }
+.cookie-import-hint code {
+  background: var(--bg3); padding: 1px 5px; border-radius: 3px;
+  font-size: 11px; font-family: 'SF Mono','Cascadia Code','Consolas',monospace;
+}
+.cookie-import-feedback { margin-top: 8px; font-size: 12px; min-height: 18px; }
+.cookie-import-feedback.success { color: var(--green); }
+.cookie-import-feedback.error { color: var(--red); }
+
 /* ── Schedule section ── */
 .schedule-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .schedule-row input[type=text] { width: 80px; text-align: center; }
@@ -1298,7 +1417,17 @@ select:focus, input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px v
     <div class="row">
       <button class="btn btn-primary" id="loginBtn" onclick="startLogin()" data-i18n="scanQr">扫码登录</button>
       <button class="btn btn-danger" id="loginCancelBtn" onclick="cancelLogin()" style="display:none" data-i18n="cancel">取消</button>
+      <button class="btn btn-primary" onclick="toggleCookieImport()" data-i18n="importCookie">导入 Cookie</button>
       <button class="btn btn-outline btn-sm" onclick="clearLogin()" data-i18n="clearSession">清除会话</button>
+    </div>
+    <div id="cookieImportArea" class="cookie-import-area">
+      <div class="cookie-import-hint" id="cookieImportHint"></div>
+      <textarea id="cookieInput" data-i18n-placeholder="cookiePlaceholder" placeholder="粘贴 Cookie 内容..."></textarea>
+      <div class="row" style="margin-top:10px;">
+        <button class="btn btn-primary btn-sm" id="cookieImportBtn" onclick="importCookie()" data-i18n="importBtn">导入</button>
+        <button class="btn btn-outline btn-sm" onclick="toggleCookieImport()" data-i18n="cancel">取消</button>
+      </div>
+      <div class="cookie-import-feedback" id="cookieImportFeedback"></div>
     </div>
     <div id="loginScreenshot" style="display:none;margin-top:14px;position:relative;user-select:none;">
       <div style="font-size:11px;color:var(--text3);margin-bottom:6px;" data-i18n="clickScreenshotHint">点击截图进行交互。下方输入文本后回车发送。</div>
@@ -1497,6 +1626,12 @@ const T = {
     discoveredAt: (t) => '最近刷新: ' + t,
     discovered: (n) => '发现 ' + n + ' 个会话',
     confirmMultiExport: (n) => '将导出 ' + n + ' 个会话并打包为 zip，是否继续？',
+    importCookie: '导入 Cookie',
+    importBtn: '导入',
+    cookiePlaceholder: '粘贴 Cookie（JSON 数组 或 key=value; 格式）...',
+    cookieHintHtml: '<ol><li>在浏览器中打开 <code>douyin.com</code> 并确保<b>已登录</b></li><li>按 <code>F12</code> 打开开发者工具 → <b>Application</b>（应用）标签</li><li>左侧展开 <b>Cookies</b> → <code>https://www.douyin.com</code></li><li>在 Cookie 表格空白处右键 → <b>Copy all cookies</b></li><li>也可在 Console 中执行 <code>document.cookie</code> 并复制结果</li></ol><div style="margin-top:4px">⚠️ 必须包含 <code>sessionid</code>，否则导入无效。</div>',
+    cookieImportSuccess: (n) => '成功导入 ' + n + ' 个 Cookie，登录状态已更新',
+    cookieImportFailed: '导入失败',
     loginFailed: '登录失败',
     wrongPassword: '密码错误',
   },
@@ -1568,6 +1703,12 @@ const T = {
     discoveredAt: (t) => 'Last refresh: ' + t,
     discovered: (n) => 'Found ' + n + ' conversations',
     confirmMultiExport: (n) => 'Export ' + n + ' conversations as a zip. Continue?',
+    importCookie: 'Import Cookie',
+    importBtn: 'Import',
+    cookiePlaceholder: 'Paste cookies (JSON array or key=value; format)...',
+    cookieHintHtml: '<ol><li>Open <code>douyin.com</code> in your browser and make sure you are <b>logged in</b></li><li>Press <code>F12</code> to open DevTools → <b>Application</b> tab</li><li>Expand <b>Cookies</b> → <code>https://www.douyin.com</code> in the left panel</li><li>Right-click the cookie table → <b>Copy all cookies</b></li><li>Or run <code>document.cookie</code> in Console and copy the result</li></ol><div style="margin-top:4px">⚠️ Must include <code>sessionid</code> or the import will fail.</div>',
+    cookieImportSuccess: (n) => 'Successfully imported ' + n + ' cookies, login state updated',
+    cookieImportFailed: 'Import failed',
     loginFailed: 'Login failed',
     wrongPassword: 'Wrong password',
   },
@@ -2106,6 +2247,47 @@ async function clearLogin() {
   const ls = document.getElementById('loginStatus');
   setText(ls, 'idle'); ls.className = 'status status-idle';
   setText(document.getElementById('loginInfo'), 'sessionCleared');
+}
+
+/* ── Cookie Import ── */
+function toggleCookieImport() {
+  const area = document.getElementById('cookieImportArea');
+  const show = !area.classList.contains('show');
+  area.classList.toggle('show', show);
+  if (show) {
+    document.getElementById('cookieImportHint').innerHTML = t('cookieHintHtml');
+    document.getElementById('cookieImportFeedback').textContent = '';
+    document.getElementById('cookieInput').value = '';
+  }
+}
+
+async function importCookie() {
+  const input = document.getElementById('cookieInput').value.trim();
+  if (!input) return;
+  const fb = document.getElementById('cookieImportFeedback');
+  const btn = document.getElementById('cookieImportBtn');
+  btn.disabled = true;
+  fb.className = 'cookie-import-feedback';
+  fb.textContent = '...';
+  try {
+    const r = await fetch('/panel/api/login/cookie-import', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ cookies: input }),
+    });
+    const d = await r.json();
+    if (r.ok) {
+      fb.className = 'cookie-import-feedback success';
+      fb.textContent = t('cookieImportSuccess', d.count || 0);
+      setTimeout(() => { checkLogin(); toggleCookieImport(); }, 1500);
+    } else {
+      fb.className = 'cookie-import-feedback error';
+      fb.textContent = d.error || t('cookieImportFailed');
+    }
+  } catch (e) {
+    fb.className = 'cookie-import-feedback error';
+    fb.textContent = t('cookieImportFailed') + ': ' + e.message;
+  } finally { btn.disabled = false; }
 }
 
 /* ── Panel Auth ── */
