@@ -5,3 +5,5 @@ sqlalchemy
 aiosqlite
 httpx
 apscheduler
+cryptography
+pillow-heif

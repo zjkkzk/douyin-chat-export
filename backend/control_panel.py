@@ -63,6 +63,18 @@ _discover_state = {
     "finished_at": None,
 }
 
+# ── Media backfill state ──
+_backfill_state = {
+    "status": "idle",  # idle | running | completed | failed
+    "total": 0,
+    "done": 0,
+    "ok": 0,
+    "failed": 0,
+    "message": "",
+    "started_at": None,
+    "finished_at": None,
+}
+
 LOG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "scrape.log")
 DISCOVER_LOG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "discover.log")
 CONV_LIST_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "conversations_list.json")
@@ -147,6 +159,119 @@ async def password_status():
     return {"has_password": bool(cfg.get("password_hash"))}
 
 
+# ── Media download toggle + backfill ──
+
+class DownloadImagesToggle(BaseModel):
+    enabled: bool
+
+
+@control_router.get("/api/config/download-images")
+async def get_download_images():
+    return {"enabled": bool(_load_config().get("download_images"))}
+
+
+@control_router.post("/api/config/download-images")
+async def set_download_images(req: DownloadImagesToggle):
+    cfg = _load_config()
+    cfg["download_images"] = bool(req.enabled)
+    _save_config(cfg)
+    return {"status": "ok", "enabled": cfg["download_images"]}
+
+
+@control_router.get("/api/media/backfill/status")
+async def backfill_status():
+    return {
+        "status": _backfill_state["status"],
+        "total": _backfill_state["total"],
+        "done": _backfill_state["done"],
+        "ok": _backfill_state["ok"],
+        "failed": _backfill_state["failed"],
+        "message": _backfill_state["message"],
+        "started_at": _backfill_state["started_at"],
+        "finished_at": _backfill_state["finished_at"],
+    }
+
+
+@control_router.post("/api/media/backfill")
+async def backfill_start():
+    if _backfill_state["status"] == "running":
+        return JSONResponse({"error": "Backfill already running"}, status_code=409)
+    asyncio.create_task(_run_backfill())
+    return {"status": "started"}
+
+
+async def _run_backfill():
+    """Download all historical image/emoji media that has a URL but no local file.
+
+    - 表情 (msg_type=2): 直接下载 media_url
+    - 图片 (msg_type=3): 从 raw_data 取 origin_url + skey，AES-GCM 解密后保存
+    """
+    from extractor.web_scraper import _save_emoji, _save_image
+    from backend.database import get_db
+
+    _backfill_state.update({
+        "status": "running", "total": 0, "done": 0, "ok": 0, "failed": 0,
+        "message": "扫描数据库...", "started_at": time.time(), "finished_at": None,
+    })
+    try:
+        media_root = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "media")
+        img_dir = os.path.join(media_root, "images")
+        emoji_dir = os.path.join(media_root, "emoji")
+        os.makedirs(img_dir, exist_ok=True)
+        os.makedirs(emoji_dir, exist_ok=True)
+
+        conn = get_db()
+        rows = conn.execute(
+            "SELECT msg_id, msg_type, media_url, raw_data FROM messages "
+            "WHERE msg_type IN (2, 3) "
+            "AND (media_local_path IS NULL OR media_local_path = '')"
+        ).fetchall()
+        _backfill_state["total"] = len(rows)
+        _backfill_state["message"] = f"待下载 {len(rows)} 条"
+
+        loop = asyncio.get_event_loop()
+        for msg_id, msg_type, url, raw in rows:
+            rel = None
+            try:
+                if msg_type == 2:
+                    if url:
+                        rel = await loop.run_in_executor(None, _save_emoji, url, emoji_dir)
+                elif msg_type == 3:
+                    try:
+                        data = json.loads(raw) if raw else {}
+                        cj = json.loads(data.get("content_json") or "{}")
+                    except Exception:
+                        cj = {}
+                    ru = cj.get("resource_url") or {}
+                    skey = ru.get("skey")
+                    origin = (ru.get("origin_url_list") or [None])[0]
+                    if skey and origin:
+                        rel = await loop.run_in_executor(
+                            None, _save_image, origin, skey, str(msg_id), img_dir,
+                        )
+                if rel:
+                    conn.execute(
+                        "UPDATE messages SET media_local_path = ? WHERE msg_id = ?",
+                        (rel, msg_id),
+                    )
+                    conn.commit()
+                    _backfill_state["ok"] += 1
+                else:
+                    _backfill_state["failed"] += 1
+            except Exception:
+                _backfill_state["failed"] += 1
+            _backfill_state["done"] += 1
+        conn.close()
+
+        _backfill_state["status"] = "completed"
+        _backfill_state["message"] = f"完成: 成功 {_backfill_state['ok']}，失败 {_backfill_state['failed']}"
+    except Exception as e:
+        _backfill_state["status"] = "failed"
+        _backfill_state["message"] = f"错误: {e}"
+    finally:
+        _backfill_state["finished_at"] = time.time()
+
+
 @control_router.get("", response_class=HTMLResponse)
 @control_router.get("/", response_class=HTMLResponse)
 async def panel_page():
@@ -204,6 +329,8 @@ async def start_scrape(req: ScrapeRequest):
         cmd.append("--incremental")
     if effective_filter:
         cmd.extend(["--filter", effective_filter])
+    if _load_config().get("download_images"):
+        cmd.append("--download-images")
 
     _scrape_state["status"] = "running"
     _scrape_state["started_at"] = time.time()
@@ -515,6 +642,8 @@ async def _cron_loop(parsed: list, incremental: bool):
                 if incremental:
                     cmd.append("--incremental")
                 cfg = _load_config()
+                if cfg.get("download_images"):
+                    cmd.append("--download-images")
                 # Preferred: schedule_selected (checkbox picks).
                 # Fallback: custom_filters (legacy).
                 # Fallback: all DB conversations (scrape everything we know).
@@ -1542,6 +1671,21 @@ select:focus, input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px v
     <div class="meta" id="exportMsg"></div>
   </div>
 
+  <!-- Media download -->
+  <div class="section">
+    <h2 data-i18n="mediaTitle">媒体下载</h2>
+    <div class="meta" style="margin-bottom:10px" data-i18n="mediaDesc">将图片/表情包下载到本地，避免抖音 CDN 链接过期后无法显示。</div>
+    <label class="conv-check" style="margin-bottom:10px;cursor:pointer;">
+      <input type="checkbox" id="downloadImagesToggle" onchange="toggleDownloadImages()">
+      <span data-i18n="autoDownloadNew">新采集消息自动下载图片到本地</span>
+    </label>
+    <div class="row">
+      <button class="btn btn-primary" id="backfillBtn" onclick="startBackfill()" data-i18n="backfillBtn">下载历史图片</button>
+      <span class="status status-idle" id="backfillStatus" data-i18n="idle">闲置</span>
+    </div>
+    <div class="meta" id="backfillMsg" style="margin-top:6px"></div>
+  </div>
+
   <div class="section">
     <h2 data-i18n="passwordTitle">密码</h2>
     <div class="meta" style="margin-bottom:8px" data-i18n="passwordDesc">设置密码以保护聊天查看器和控制面板。</div>
@@ -1626,6 +1770,12 @@ const T = {
     discoveredAt: (t) => '最近刷新: ' + t,
     discovered: (n) => '发现 ' + n + ' 个会话',
     confirmMultiExport: (n) => '将导出 ' + n + ' 个会话并打包为 zip，是否继续？',
+    mediaTitle: '媒体下载',
+    mediaDesc: '将图片/表情包下载到本地，避免抖音 CDN 链接过期后无法显示。',
+    autoDownloadNew: '新采集消息自动下载图片到本地',
+    backfillBtn: '下载历史图片',
+    backfillRunning: (done, total) => '下载中: ' + done + ' / ' + total,
+    backfillDone: (ok, fail) => '完成：成功 ' + ok + '，失败 ' + fail,
     importCookie: '导入 Cookie',
     importBtn: '导入',
     cookiePlaceholder: '粘贴 Cookie（JSON 数组 或 key=value; 格式）...',
@@ -1703,6 +1853,12 @@ const T = {
     discoveredAt: (t) => 'Last refresh: ' + t,
     discovered: (n) => 'Found ' + n + ' conversations',
     confirmMultiExport: (n) => 'Export ' + n + ' conversations as a zip. Continue?',
+    mediaTitle: 'Media Download',
+    mediaDesc: 'Save images and emoji locally to keep them viewable after Douyin CDN URLs expire.',
+    autoDownloadNew: 'Auto-download images to local for newly scraped messages',
+    backfillBtn: 'Backfill historical images',
+    backfillRunning: (done, total) => 'Downloading: ' + done + ' / ' + total,
+    backfillDone: (ok, fail) => 'Done: ' + ok + ' succeeded, ' + fail + ' failed',
     importCookie: 'Import Cookie',
     importBtn: 'Import',
     cookiePlaceholder: 'Paste cookies (JSON array or key=value; format)...',
@@ -2065,6 +2221,56 @@ async function startExport() {
   loadStatus();
 }
 
+/* ── Media download ── */
+let backfillPollTimer = null;
+
+async function loadDownloadImages() {
+  try {
+    const r = await fetch('/panel/api/config/download-images');
+    const d = await r.json();
+    document.getElementById('downloadImagesToggle').checked = !!d.enabled;
+  } catch {}
+}
+
+async function toggleDownloadImages() {
+  const enabled = document.getElementById('downloadImagesToggle').checked;
+  await fetch('/panel/api/config/download-images', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ enabled }),
+  });
+}
+
+async function startBackfill() {
+  document.getElementById('backfillBtn').disabled = true;
+  setStatusEl(document.getElementById('backfillStatus'), 'running');
+  setDynText(document.getElementById('backfillMsg'), '');
+  await fetch('/panel/api/media/backfill', { method: 'POST' });
+  if (backfillPollTimer) clearInterval(backfillPollTimer);
+  backfillPollTimer = setInterval(pollBackfill, 1500);
+}
+
+async function pollBackfill() {
+  try {
+    const r = await fetch('/panel/api/media/backfill/status');
+    const d = await r.json();
+    const status = d.status || 'idle';
+    setStatusEl(document.getElementById('backfillStatus'), status);
+    if (status === 'running') {
+      setDynText(document.getElementById('backfillMsg'), t('backfillRunning', d.done || 0, d.total || 0));
+    } else if (status === 'completed') {
+      setDynText(document.getElementById('backfillMsg'), t('backfillDone', d.ok || 0, d.failed || 0));
+      document.getElementById('backfillBtn').disabled = false;
+      clearInterval(backfillPollTimer); backfillPollTimer = null;
+    } else if (status === 'failed') {
+      setDynText(document.getElementById('backfillMsg'), d.message || '');
+      document.getElementById('backfillBtn').disabled = false;
+      clearInterval(backfillPollTimer); backfillPollTimer = null;
+    } else {
+      document.getElementById('backfillBtn').disabled = false;
+    }
+  } catch {}
+}
+
 /* ── Password ── */
 async function loadPasswordStatus() {
   const r = await fetch('/panel/api/password/status');
@@ -2316,6 +2522,8 @@ async function panelAuthCheck() {
       await loadDiscoveredConvs();
       loadStatus();
       loadPasswordStatus();
+      loadDownloadImages();
+      pollBackfill();
       setInterval(loadStatus, 5000);
     } else {
       document.getElementById('loginOverlay').style.display = 'flex';

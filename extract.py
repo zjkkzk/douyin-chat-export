@@ -13,6 +13,7 @@ def _parse_args():
         "mode": "extract",
         "name_filter": None,
         "incremental": "--incremental" in sys.argv,
+        "download_images": "--download-images" in sys.argv,
         "output_format": "jsonl",
         "output_path": None,
     }
@@ -64,6 +65,7 @@ async def run():
         discovery_mode=(args["mode"] == "discover"),
         name_filter=args["name_filter"],
         incremental=args["incremental"],
+        download_images=args["download_images"],
     )
 
     try:

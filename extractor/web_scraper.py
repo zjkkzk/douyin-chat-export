@@ -52,11 +52,137 @@ SEL_MSG_AVATAR = 'img[class*="avatar"]'
 WEEKDAY_MAP = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
 
 
+_HEIF_BRANDS = {b"heic", b"heix", b"mif1", b"msf1", b"hevc", b"hevx", b"heim", b"heis", b"hevm", b"hevs"}
+_MP4_BRANDS = {b"mp42", b"mp41", b"isom", b"iso2", b"iso4", b"iso5", b"iso6", b"avc1", b"M4V ", b"qt  "}
+
+
+def _detect_media_format(data):
+    """从字节流头部识别媒体格式，返回 (kind, ext)。
+
+    kind ∈ {'image', 'video', 'heif'}, ext 包含点号。
+    HEIF 单独区分出来，因为浏览器不原生支持，下载后需要转 JPEG。
+    """
+    if data[:3] == b"\xff\xd8\xff":
+        return ("image", ".jpg")
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return ("image", ".png")
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ("image", ".webp")
+    if data[:3] == b"GIF":
+        return ("image", ".gif")
+    # ISO Base Media (MP4 / HEIF 共用)：bytes 4-8 是 "ftyp"，brand 在 8-12
+    if data[4:8] == b"ftyp":
+        brand = data[8:12]
+        if brand in _HEIF_BRANDS:
+            return ("heif", ".heic")
+        if brand in _MP4_BRANDS:
+            return ("video", ".mp4")
+        # 未知 brand：保守起见当 mp4 视频处理
+        return ("video", ".mp4")
+    return ("image", ".jpg")
+
+
+def _heic_to_jpeg(heic_bytes):
+    """将 HEIC 字节流转为 JPEG 字节流（浏览器不原生支持 HEIC）。"""
+    import io
+    from PIL import Image
+    import pillow_heif
+
+    pillow_heif.register_heif_opener()
+    im = Image.open(io.BytesIO(heic_bytes))
+    if im.mode not in ("RGB", "L"):
+        im = im.convert("RGB")
+    out = io.BytesIO()
+    im.save(out, "JPEG", quality=90)
+    return out.getvalue()
+
+
+def _fetch(url, timeout=20):
+    import urllib.request
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://www.douyin.com/",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def _save_emoji(url, emoji_dir):
+    """下载表情包（普通 PNG/WEBP，无加密）。按 URL 路径哈希去重。
+
+    Returns 相对路径（如 'emoji/abc.png'）或 None。
+    """
+    import hashlib
+    from urllib.parse import urlparse
+
+    path = urlparse(url).path
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
+        ext = ".png"
+    h = hashlib.md5(path.encode("utf-8")).hexdigest()[:16]
+    filename = f"{h}{ext}"
+    target = os.path.join(emoji_dir, filename)
+    rel = f"emoji/{filename}"
+    if os.path.exists(target):
+        return rel
+    data = _fetch(url)
+    if len(data) < 100:
+        return None
+    with open(target, "wb") as f:
+        f.write(data)
+    return rel
+
+
+def _save_image(origin_url, skey_hex, server_id, img_dir, video_dir=None):
+    """下载并解密媒体（图片或视频），按实际格式存到对应目录。
+
+    抖音 IM `awe_type=2702/2703/2704` 既可能是图片也可能是视频，
+    必须解密后看 magic bytes 才能知道。AES-256-GCM:
+    - key = skey hex (32 bytes)
+    - IV  = 密文前 12 字节
+    - 密文+tag = 剩余部分
+
+    Returns 相对路径（如 'images/xxx.jpg' 或 'videos/xxx.mp4'）或 None。
+    """
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    if video_dir is None:
+        video_dir = os.path.join(os.path.dirname(img_dir), "videos")
+    os.makedirs(video_dir, exist_ok=True)
+
+    # 已存在？
+    for d, prefix in ((img_dir, "images"), (video_dir, "videos")):
+        for ext in (".jpg", ".png", ".webp", ".gif", ".mp4"):
+            t = os.path.join(d, f"{server_id}{ext}")
+            if os.path.exists(t):
+                return f"{prefix}/{server_id}{ext}"
+
+    cipher = _fetch(origin_url)
+    if len(cipher) < 28:
+        return None
+    key = bytes.fromhex(skey_hex)
+    iv = cipher[:12]
+    body = cipher[12:]
+    plain = AESGCM(key).decrypt(iv, body, None)
+    kind, ext = _detect_media_format(plain)
+    if kind == "heif":
+        # 浏览器不支持 HEIC，转为 JPEG
+        plain = _heic_to_jpeg(plain)
+        kind, ext = "image", ".jpg"
+    target_dir = video_dir if kind == "video" else img_dir
+    prefix = "videos" if kind == "video" else "images"
+    filename = f"{server_id}{ext}"
+    with open(os.path.join(target_dir, filename), "wb") as f:
+        f.write(plain)
+    return f"{prefix}/{filename}"
+
+
 class WebChatScraper:
-    def __init__(self, discovery_mode=False, name_filter=None, incremental=False):
+    def __init__(self, discovery_mode=False, name_filter=None, incremental=False, download_images=False):
         self.discovery_mode = discovery_mode
         self.name_filter = name_filter
         self.incremental = incremental
+        self.download_images = download_images
         self.pw = None
         self.context = None
         self.page = None
@@ -583,6 +709,50 @@ class WebChatScraper:
                     print(f"  [voice] 下载失败（空响应 {len(data)}B）: {server_id}")
             except Exception as e:
                 print(f"  [voice] 下载失败: {server_id}: {e}")
+
+    async def _download_image_files(self, messages):
+        """下载图片/表情包到本地。
+        - 表情：直接保存（无加密），按 URL 路径哈希去重
+        - 图片：从 origin_url 拉密文，AES-256-GCM 解密 (skey) 后保存
+        """
+        if not self.download_images:
+            return
+        media_root = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "media")
+        img_dir = os.path.join(media_root, "images")
+        emoji_dir = os.path.join(media_root, "emoji")
+        os.makedirs(img_dir, exist_ok=True)
+        os.makedirs(emoji_dir, exist_ok=True)
+
+        ok, fail = 0, 0
+        for m in messages:
+            mt = m.get("msg_type")
+            if mt == "emoji":
+                url = m.get("image_src")
+                if not url:
+                    continue
+                try:
+                    rel = _save_emoji(url, emoji_dir)
+                    if rel:
+                        m["local_path"] = rel; ok += 1
+                except Exception as e:
+                    fail += 1
+                    print(f"  [media] emoji 失败: {e}")
+            elif mt == "image":
+                try:
+                    cj = json.loads(m.get("content_json", "") or "{}")
+                    ru = cj.get("resource_url") or {}
+                    skey = ru.get("skey")
+                    origin = (ru.get("origin_url_list") or [None])[0]
+                    if not (skey and origin):
+                        continue
+                    rel = _save_image(origin, skey, m.get("server_id", "unknown"), img_dir)
+                    if rel:
+                        m["local_path"] = rel; ok += 1
+                except Exception as e:
+                    fail += 1
+                    print(f"  [media] image 失败: {e}")
+        if ok or fail:
+            print(f"  [media] 图片/表情 已下载 {ok} 个 (失败 {fail})")
 
     async def _extract_and_save_user_info(self, conv_id):
         """从 userInfoStore 提取用户信息（昵称、头像、unique_id），下载头像到本地。"""
@@ -1405,6 +1575,8 @@ class WebChatScraper:
 
             # 下载语音文件
             await self._download_voice_files(converted)
+            # 下载图片/表情（按配置）
+            await self._download_image_files(converted)
 
             newly_inserted = self._store_messages(converted, conv_id, batch_seq_start=0)
             total_saved += newly_inserted

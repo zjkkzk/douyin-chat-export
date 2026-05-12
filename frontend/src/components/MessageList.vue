@@ -91,16 +91,24 @@
                 <span class="msg-ref-content">{{ getRefContent(getRefMsg(msg)) }}</span>
               </div>
               <!-- 表情包 -->
-              <div v-if="msg.media_url && msg.msg_type === 2" class="msg-media">
-                <img :src="msg.media_url" :alt="msg.content" loading="lazy" @error="onImgError" />
+              <div v-if="msg.msg_type === 2 && getEmojiSrc(msg)" class="msg-media">
+                <img :src="getEmojiSrc(msg)" :alt="msg.content" loading="lazy" @click="openLightbox(getEmojiSrc(msg))" @error="onImgError" />
               </div>
-              <!-- 图片（CDN URL 已加密，使用 inline_pic 缩略图） -->
+              <!-- 图片/视频：优先本地原文件，回退到 inline_pic 缩略图 -->
               <div v-else-if="msg.msg_type === 3" class="msg-media">
+                <video
+                  v-if="isVideoMsg(msg)"
+                  :src="'/media/' + msg.media_local_path"
+                  controls
+                  preload="metadata"
+                  :poster="getInlinePic(msg)"
+                />
                 <img
-                  v-if="getInlinePic(msg)"
-                  :src="getInlinePic(msg)"
+                  v-else-if="getImageSrc(msg)"
+                  :src="getImageSrc(msg)"
                   alt="图片"
                   loading="lazy"
+                  @click="openLightbox(getImageSrc(msg))"
                 />
                 <div v-else class="msg-media-missing">[图片已失效]</div>
               </div>
@@ -184,6 +192,12 @@
         </div>
       </div>
     </template>
+
+    <!-- Lightbox -->
+    <div v-if="lightboxSrc" class="lightbox-overlay" @click.self="closeLightbox">
+      <img class="lightbox-img" :src="lightboxSrc" @click.self="closeLightbox" />
+      <button class="lightbox-close" @click="closeLightbox">×</button>
+    </div>
   </div>
 </template>
 
@@ -480,6 +494,23 @@ function getInlinePic(msg) {
   return null
 }
 
+// 是否是视频消息（msg_type=3 但本地是 mp4）
+function isVideoMsg(msg) {
+  return msg.media_local_path && /\.mp4$/i.test(msg.media_local_path)
+}
+
+// 图片源：本地大图 > inline_pic 缩略图（视频走单独分支）
+function getImageSrc(msg) {
+  if (msg.media_local_path && !isVideoMsg(msg)) return '/media/' + msg.media_local_path
+  return getInlinePic(msg)
+}
+
+// 表情源：本地 > CDN URL
+function getEmojiSrc(msg) {
+  if (msg.media_local_path) return '/media/' + msg.media_local_path
+  return msg.media_url || null
+}
+
 // 撤回消息检测
 function isRecalled(msg) {
   const cj = getContentJson(msg)
@@ -562,6 +593,17 @@ function getRefNickname(ref) {
 
 // 高亮的消息 ID
 const highlightMsgId = ref(null)
+
+// Lightbox state
+const lightboxSrc = ref(null)
+function openLightbox(src) {
+  if (!src) return
+  lightboxSrc.value = src
+}
+function closeLightbox() { lightboxSrc.value = null }
+function onLightboxKey(e) {
+  if (e.key === 'Escape') closeLightbox()
+}
 
 async function jumpToRefMsg(ref) {
   if (!ref || !ref.server_id || !props.conversation) return
@@ -740,11 +782,13 @@ onMounted(() => {
     }
   }
   tryBind()
+  window.addEventListener('keydown', onLightboxKey)
 })
 onUnmounted(() => {
   if (listRef.value) {
     listRef.value.removeEventListener('scroll', onListScroll)
   }
+  window.removeEventListener('keydown', onLightboxKey)
 })
 
 function formatTime(ts) {
@@ -1229,6 +1273,12 @@ watch(() => props.jumpToSeq, async (seq) => {
   border-radius: 8px;
   cursor: pointer;
 }
+.msg-media video {
+  max-width: 280px;
+  max-height: 360px;
+  border-radius: 8px;
+  background: #000;
+}
 .msg-inline-pic {
   opacity: 0.85;
   filter: blur(0.5px);
@@ -1240,6 +1290,33 @@ watch(() => props.jumpToSeq, async (seq) => {
   background: var(--bg-tertiary);
   border-radius: 8px;
 }
+
+/* Lightbox */
+.lightbox-overlay {
+  position: fixed; inset: 0; z-index: 9999;
+  background: rgba(0, 0, 0, 0.85);
+  display: flex; align-items: center; justify-content: center;
+  cursor: zoom-out;
+  animation: lightboxIn 0.15s ease-out;
+}
+@keyframes lightboxIn { from { opacity: 0; } to { opacity: 1; } }
+.lightbox-img {
+  max-width: 92vw; max-height: 92vh;
+  object-fit: contain;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+  border-radius: 4px;
+  cursor: zoom-out;
+}
+.lightbox-close {
+  position: absolute; top: 20px; right: 28px;
+  width: 40px; height: 40px;
+  background: rgba(255, 255, 255, 0.1);
+  border: none; border-radius: 50%;
+  color: #fff; font-size: 28px; line-height: 1;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.lightbox-close:hover { background: rgba(255, 255, 255, 0.2); }
 
 .msg-time {
   font-size: 11px;
