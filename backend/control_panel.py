@@ -321,6 +321,12 @@ async def start_scrape(req: ScrapeRequest):
     if _scrape_state["status"] == "running":
         return JSONResponse({"error": "Scrape already running"}, status_code=409)
 
+    if not _has_sessionid_in_profile():
+        return JSONResponse(
+            {"error": "未检测到登录态，请先扫码登录或导入 Cookie"},
+            status_code=400,
+        )
+
     # Selected conversations (checkbox list) take precedence over free-text filter
     effective_filter = ",".join(req.conversations) if req.conversations else req.filter
 
@@ -427,6 +433,30 @@ def _read_conv_list():
         return {"discovered_at": 0, "items": []}
 
 
+def _has_sessionid_in_profile() -> bool:
+    """Fast pre-check: read Chromium's Cookies SQLite directly to see if a
+    `sessionid` cookie exists for any douyin host. Avoids spawning a browser.
+
+    Returns False if the DB is missing, unreadable (locked by a running
+    Chromium), or has no matching row.
+    """
+    db_path = os.path.join(_USER_DATA_DIR, "Default", "Cookies")
+    if not os.path.isfile(db_path):
+        return False
+    import sqlite3
+    try:
+        # uri=ro to avoid taking a write lock; immutable=1 lets us read even
+        # while another process holds locks.
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True, timeout=1)
+        row = conn.execute(
+            "SELECT 1 FROM cookies WHERE name = 'sessionid' AND host_key LIKE '%douyin%' LIMIT 1"
+        ).fetchone()
+        conn.close()
+        return row is not None
+    except Exception:
+        return False
+
+
 @control_router.post("/api/conversations/refresh")
 async def refresh_conversations():
     """Run a lightweight scrape that only enumerates the conversation list."""
@@ -434,6 +464,14 @@ async def refresh_conversations():
         return JSONResponse({"error": "Refresh already running"}, status_code=409)
     if _scrape_state["status"] == "running":
         return JSONResponse({"error": "Scraper is running — stop it first"}, status_code=409)
+
+    # Fast pre-check: don't spawn the 3-minute browser wait if we already
+    # know there's no usable session.
+    if not _has_sessionid_in_profile():
+        return JSONResponse(
+            {"error": "未检测到登录态，请先扫码登录或导入 Cookie"},
+            status_code=400,
+        )
 
     _discover_state["status"] = "running"
     _discover_state["message"] = "正在加载会话列表..."
@@ -446,6 +484,7 @@ async def refresh_conversations():
 
 
 async def _run_discover(cmd):
+    proc = None
     try:
         os.makedirs(os.path.dirname(DISCOVER_LOG_PATH), exist_ok=True)
         with open(DISCOVER_LOG_PATH, "w") as log_file:
@@ -463,15 +502,28 @@ async def _run_discover(cmd):
             count = len(data.get("items", []))
             _discover_state["status"] = "completed"
             _discover_state["message"] = f"发现 {count} 个会话"
+        elif proc.returncode == 2:
+            _discover_state["status"] = "failed"
+            _discover_state["message"] = "未检测到登录态，请先扫码或导入 Cookie"
         else:
             _discover_state["status"] = "failed"
             _discover_state["message"] = f"刷新失败 (exit {proc.returncode})"
     except Exception as e:
         _discover_state["status"] = "failed"
         _discover_state["message"] = f"刷新错误: {e}"
+        # Best-effort: kill any lingering subprocess so it doesn't pin the state
+        if proc and proc.returncode is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
     finally:
         _discover_state["finished_at"] = time.time()
         _discover_state["process"] = None
+        # Defensive: ensure status is never left at "running" when this coroutine exits
+        if _discover_state["status"] == "running":
+            _discover_state["status"] = "failed"
+            _discover_state["message"] = _discover_state["message"] or "刷新中断"
 
 
 @control_router.get("/api/conversations/refresh/status")
@@ -495,6 +547,12 @@ async def refresh_stop():
         _discover_state["status"] = "idle"
         _discover_state["message"] = "已停止"
         return {"status": "stopped"}
+    # No live process — if state is still "running", force-reset (was stuck)
+    if _discover_state["status"] == "running":
+        _discover_state["status"] = "idle"
+        _discover_state["message"] = "已重置"
+        _discover_state["finished_at"] = time.time()
+        return {"status": "reset"}
     return {"status": "not_running"}
 
 
@@ -1412,6 +1470,18 @@ select:focus, input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px v
 .cookie-import-feedback.success { color: var(--green); }
 .cookie-import-feedback.error { color: var(--red); }
 
+/* Inline error banner (replaces alert popups) */
+.inline-error {
+  margin-top: 10px;
+  padding: 8px 12px;
+  background: var(--accent-bg);
+  border: 1px solid var(--red);
+  color: var(--red);
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
 /* ── Schedule section ── */
 .schedule-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .schedule-row input[type=text] { width: 80px; text-align: center; }
@@ -1590,6 +1660,7 @@ select:focus, input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px v
       <button class="btn btn-danger" id="stopRefreshBtn" onclick="stopRefreshConvs()" style="display:none" data-i18n="cancel">取消</button>
       <span class="meta" id="discoverMeta"></span>
     </div>
+    <div id="refreshError" class="inline-error" style="display:none;"></div>
     <div class="meta" id="discoverHint" style="margin-top:6px;" data-i18n="convListHint">点击"刷新会话列表"从抖音加载全部会话，然后在下方采集/导出/定时各节勾选需要处理的会话。</div>
   </div>
 
@@ -1791,6 +1862,7 @@ const T = {
     cookieImportFailed: '导入失败',
     loginFailed: '登录失败',
     wrongPassword: '密码错误',
+    refreshFailed: '刷新失败',
   },
   en: {
     appTitle: 'Douyin Chat Export',
@@ -1874,6 +1946,7 @@ const T = {
     cookieImportFailed: 'Import failed',
     loginFailed: 'Login failed',
     wrongPassword: 'Wrong password',
+    refreshFailed: 'Refresh failed',
   },
 };
 
@@ -2130,17 +2203,31 @@ function selectAllConvs(prefix, checked) {
   persistSelection(section);
 }
 
+function showRefreshError(msg) {
+  const el = document.getElementById('refreshError');
+  if (!el) return;
+  if (msg) {
+    el.textContent = msg;
+    el.style.display = '';
+  } else {
+    el.textContent = '';
+    el.style.display = 'none';
+  }
+}
+
 async function refreshConvs() {
+  showRefreshError('');
   document.getElementById('refreshConvsBtn').disabled = true;
   try {
     const r = await fetch('/panel/api/conversations/refresh', { method: 'POST' });
     if (!r.ok) {
       const d = await r.json().catch(() => ({}));
-      alert(d.error || 'Failed');
+      showRefreshError(d.error || t('refreshFailed'));
       document.getElementById('refreshConvsBtn').disabled = false;
       return;
     }
-  } catch {
+  } catch (e) {
+    showRefreshError(t('refreshFailed') + ': ' + (e.message || e));
     document.getElementById('refreshConvsBtn').disabled = false;
     return;
   }

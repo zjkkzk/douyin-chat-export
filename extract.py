@@ -57,7 +57,7 @@ async def run():
     # Export mode: no browser needed
     if args["mode"] == "export":
         run_export(args)
-        return
+        return 0
 
     from extractor.web_scraper import WebChatScraper
 
@@ -73,7 +73,7 @@ async def run():
         logged_in = await scraper.wait_for_login()
         if not logged_in:
             print("[-] 未能登录，退出")
-            return
+            return 2  # non-zero exit so the panel surfaces this as a failure
 
         if args["mode"] == "discover":
             duration = 60
@@ -107,15 +107,19 @@ async def run():
         else:
             await scraper.extract_all()
 
+        return 0
+
     except KeyboardInterrupt:
         print("\n[*] 用户中断")
+        return 130
     except Exception as e:
         print(f"\n[-] 错误: {e}")
         import traceback
         traceback.print_exc()
+        return 1
     finally:
         await scraper.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(run())
+    sys.exit(asyncio.run(run()) or 0)
