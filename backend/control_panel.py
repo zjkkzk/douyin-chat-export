@@ -397,6 +397,19 @@ async def scrape_log(lines: int = 50):
         return {"log": ""}
 
 
+@control_router.get("/api/conversations/refresh/log")
+async def discover_log(lines: int = 80):
+    if not os.path.exists(DISCOVER_LOG_PATH):
+        return {"log": ""}
+    try:
+        with open(DISCOVER_LOG_PATH, "r", errors="replace") as f:
+            all_lines = f.readlines()
+        tail = all_lines[-lines:] if len(all_lines) > lines else all_lines
+        return {"log": "".join(tail)}
+    except Exception:
+        return {"log": ""}
+
+
 @control_router.post("/api/scrape/stop")
 async def stop_scrape():
     proc = _scrape_state.get("process")
@@ -1662,6 +1675,7 @@ select:focus, input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px v
     </div>
     <div id="refreshError" class="inline-error" style="display:none;"></div>
     <div class="meta" id="discoverHint" style="margin-top:6px;" data-i18n="convListHint">点击"刷新会话列表"从抖音加载全部会话，然后在下方采集/导出/定时各节勾选需要处理的会话。</div>
+    <div class="log-box" id="discoverLog"></div>
   </div>
 
   <!-- Scraper -->
@@ -2231,9 +2245,10 @@ async function refreshConvs() {
     document.getElementById('refreshConvsBtn').disabled = false;
     return;
   }
-  // Poll status
+  // Poll status + log
   const poll = async () => {
     await loadDiscoveredConvs();
+    await loadDiscoverLog();
     if (lastDiscoverStatus === 'running') {
       setTimeout(poll, 1500);
     }
@@ -2244,6 +2259,7 @@ async function refreshConvs() {
 async function stopRefreshConvs() {
   await fetch('/panel/api/conversations/refresh/stop', { method: 'POST' });
   loadDiscoveredConvs();
+  loadDiscoverLog();
 }
 
 async function loadLog() {
@@ -2254,6 +2270,22 @@ async function loadLog() {
     box.textContent = d.log || t('noOutput');
     box.classList.add('show');
     box.scrollTop = box.scrollHeight;
+  } catch {}
+}
+
+async function loadDiscoverLog() {
+  try {
+    const r = await fetch('/panel/api/conversations/refresh/log?lines=80');
+    const d = await r.json();
+    const box = document.getElementById('discoverLog');
+    if (!box) return;
+    if (d.log) {
+      box.textContent = d.log;
+      box.classList.add('show');
+      box.scrollTop = box.scrollHeight;
+    } else {
+      box.classList.remove('show');
+    }
   } catch {}
 }
 
@@ -2614,6 +2646,7 @@ async function panelAuthCheck() {
       // can render with correct prior state.
       await loadSelections();
       await loadDiscoveredConvs();
+      loadDiscoverLog();
       loadStatus();
       loadPasswordStatus();
       loadDownloadImages();
