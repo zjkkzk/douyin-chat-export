@@ -1136,6 +1136,41 @@ async def login_clear():
     return {"status": "cleared"}
 
 
+def _validate_cookie_entries(parsed: list[dict]) -> tuple[list[str], list[str]]:
+    """Pre-flight check on parsed cookies. Returns (errors, warnings)."""
+    errors: list[str] = []
+    warnings: list[str] = []
+    sids = [c for c in parsed if c["name"] == "sessionid"]
+    if not sids:
+        errors.append("Cookie 中未包含 sessionid，请确保已登录后再导出（cookie-editor 需全选导出）")
+        return errors, warnings
+
+    sid = sids[0]
+    value = (sid.get("value") or "").strip()
+    if not value:
+        errors.append("sessionid 的值为空")
+    elif len(value) < 16:
+        warnings.append(f"sessionid 长度异常 ({len(value)} 字节)，可能被截断")
+
+    domain = (sid.get("domain") or "").lstrip(".")
+    if domain and domain != "douyin.com" and not domain.endswith(".douyin.com"):
+        errors.append(
+            f"sessionid 的 domain 是 .{domain}（应为 .douyin.com）"
+            "—— 可能在子站点（iesdouyin.com 等）导出了，请回到 www.douyin.com 重导"
+        )
+
+    exp = sid.get("expires")
+    if exp and exp > 0 and exp < time.time():
+        errors.append("sessionid 已过期（expirationDate 在过去），请重新登录后再导出")
+
+    if len(parsed) < 3:
+        warnings.append(
+            f"只解析出 {len(parsed)} 个 cookie，抖音通常需要 10+ 个才能完整工作，"
+            "建议在 cookie-editor 里全选后再导出"
+        )
+    return errors, warnings
+
+
 @control_router.post("/api/login/cookie-import")
 async def login_cookie_import(req: CookieImportRequest):
     """Import cookies from browser DevTools or document.cookie string."""
@@ -1197,11 +1232,17 @@ async def login_cookie_import(req: CookieImportRequest):
 
     if not parsed:
         return JSONResponse({"error": "未能解析出任何 Cookie"}, status_code=400)
-    if not any(c["name"] == "sessionid" for c in parsed):
-        return JSONResponse(
-            {"error": "Cookie 中未包含 sessionid，请确保已登录后再导出"},
-            status_code=400,
-        )
+
+    errors, warnings = _validate_cookie_entries(parsed)
+    if errors:
+        return JSONResponse({"error": "；".join(errors)}, status_code=400)
+
+    # Session cookies (no expirationDate) get dropped on browser restart,
+    # so the next login probe wouldn't see them. Pin a 30-day default.
+    default_exp = time.time() + 30 * 86400
+    for c in parsed:
+        if "expires" not in c:
+            c["expires"] = default_exp
 
     try:
         from playwright.async_api import async_playwright
@@ -1220,11 +1261,29 @@ async def login_cookie_import(req: CookieImportRequest):
         await ctx.add_cookies(parsed)
         cookies = await ctx.cookies("https://www.douyin.com")
         ok = "sessionid" in {c["name"] for c in cookies}
+        all_cookies = await ctx.cookies()  # everything regardless of url, for diagnostics
         await ctx.close()
         await pw.stop()
         if ok:
-            return {"status": "ok", "message": f"成功导入 {len(parsed)} 个 Cookie", "count": len(parsed)}
-        return JSONResponse({"error": "Cookie 导入后验证失败"}, status_code=400)
+            msg = f"成功导入 {len(parsed)} 个 Cookie"
+            if warnings:
+                msg += "（注意：" + "；".join(warnings) + "）"
+            return {"status": "ok", "message": msg, "count": len(parsed),
+                    "warnings": warnings}
+        # Verification failed — diagnose why so the user knows what to fix.
+        sid_other = [c for c in all_cookies if c["name"] == "sessionid"]
+        if sid_other:
+            wrong_domain = sid_other[0].get("domain", "?")
+            return JSONResponse(
+                {"error": f"sessionid 被加载到 domain={wrong_domain}，"
+                          f"对 www.douyin.com 不生效。请确认 cookie 的 domain 是 .douyin.com"},
+                status_code=400,
+            )
+        return JSONResponse(
+            {"error": "sessionid 导入后无法在 douyin.com 读取到，"
+                      "可能已被服务端注销，请重新登录后再导出"},
+            status_code=400,
+        )
     except Exception as e:
         return JSONResponse({"error": f"导入失败: {e}"}, status_code=500)
 
