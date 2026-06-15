@@ -4,7 +4,9 @@ import base64
 import json
 import mimetypes
 import os
+import re
 import time
+import urllib.parse
 
 from extractor.models import get_db
 
@@ -16,6 +18,102 @@ CHATLAB_TYPE_MAP = {
     4: 24,  # share → SHARE
     0: 99,  # other → OTHER
 }
+
+
+_STICKER_HEX_RE = re.compile(r"-ts-([0-9a-fA-F]{4,})(?:\.[a-zA-Z0-9]{1,5})?$")
+
+
+def _decode_sticker_name(url: str) -> str | None:
+    """Recover a sticker's human-readable name from a Douyin IM CDN URL.
+
+    URLs look like .../im-resource/<digits>-ts-<utf8-hex>?...
+    where <utf8-hex> is the UTF-8 bytes of e.g. "续火花.png" as hex.
+    Returns the decoded name without extension, or None on no match.
+    """
+    if not url:
+        return None
+    try:
+        path = urllib.parse.urlparse(url).path
+        last = path.rsplit("/", 1)[-1]
+        m = _STICKER_HEX_RE.search(last)
+        if not m:
+            return None
+        raw = bytes.fromhex(m.group(1))
+        name = raw.decode("utf-8")
+        # Strip a trailing extension like .png/.webp/.gif
+        base, sep, ext = name.rpartition(".")
+        if sep and base and len(ext) <= 4 and ext.isalnum():
+            return base
+        return name
+    except (UnicodeDecodeError, ValueError):
+        return None
+
+
+def _emoji_text_label(content: str | None, media_url: str | None) -> str:
+    """Pick a text label '[name]' for an emoji message.
+    Prefers the URL-decoded name (most reliable), then the existing content,
+    finally a generic placeholder.
+    """
+    name = _decode_sticker_name(media_url or "")
+    if name:
+        return f"[{name}]"
+    c = (content or "").strip()
+    if c and c != "[表情]":
+        if c.startswith("[") and c.endswith("]"):
+            return c
+        return f"[{c}]"
+    return "[表情]"
+
+
+_TEMPLATE_PLACEHOLDER_RE = re.compile(r"\{\{\d+\}\}")
+
+
+def _render_template_tips(obj: dict) -> str | None:
+    """渲染抖音系统消息模板。
+    例：{"tips":"{{1}}赞了你分享的 {{2}}","template":[{"key":1,"name":"对方"},{"key":2,"name":"视频X"}]}
+    → "对方赞了你分享的 视频X"
+    """
+    tips = obj.get("tips") or obj.get("hint") or obj.get("title")
+    if not tips:
+        return None
+    names = {}
+    for it in obj.get("template") or []:
+        if isinstance(it, dict) and it.get("key") is not None:
+            names[it["key"]] = (it.get("name") or "").strip()
+    out = tips
+    for k, name in names.items():
+        out = out.replace(f"{{{{{k}}}}}", name)
+    out = _TEMPLATE_PLACEHOLDER_RE.sub("", out).strip()
+    return out or None
+
+
+def _system_message_text(content: str | None, cj: dict | None = None) -> str:
+    """msg_type=0 系统消息的可读文本。
+    - 文本（已是 [语音 X秒]）原样返回
+    - JSON 模板渲染成 [系统] 前缀的可读文字（优先用完整 cj，content 在 DB 里被截 200 字符）
+    - 无法识别的兜底为 [系统消息]
+    """
+    c = (content or "").strip()
+    if c and not c.startswith("{"):
+        return c
+    obj = cj if isinstance(cj, dict) else None
+    if not obj and c.startswith("{"):
+        try:
+            obj = json.loads(c)
+        except json.JSONDecodeError:
+            obj = None
+    if not obj:
+        return "[系统消息]"
+    rendered = _render_template_tips(obj)
+    if rendered:
+        return f"[系统] {rendered}"
+    if obj.get("aweType") == 193 or obj.get("tips") == "通话成功":
+        return "[通话成功]"
+    title = obj.get("title") or ""
+    hint = obj.get("hint") or ""
+    if "看视频" in title or "通话邀请" in hint:
+        return "[视频通话邀请]"
+    return "[系统消息]"
 
 
 def _file_to_data_url(filepath: str) -> str | None:
@@ -188,7 +286,10 @@ class ChatLabExporter:
         chatlab_messages = []
         image_count = 0
         image_embedded = 0
+        emoji_count = 0
         voice_count = 0
+        system_count = 0
+        share_normalized = 0
         ref_count = 0
 
         for msg in messages:
@@ -203,31 +304,22 @@ class ChatLabExporter:
                 display_name = owner_name if uid == owner_uid else conv_name
 
             # 语音消息：msg_type=0 但有 resource_url + duration
+            # 不再嵌 base64 / CDN URL —— 对 LLM 无意义且每条几百 KB；用纯文字标签即可。
             is_voice = False
             if cj and cj.get("resource_url") and cj.get("duration"):
                 is_voice = True
-                chatlab_type = 3  # AUDIO
+                chatlab_type = 0  # TEXT
                 dur_sec = round(cj["duration"] / 1000)
+                content = f"[语音 {dur_sec}秒]" if dur_sec else "[语音]"
+                voice_count += 1
 
-                # 优先本地文件
-                local_path = msg["media_local_path"]
-                if local_path:
-                    full_path = os.path.join(media_dir, local_path)
-                    data_url = _file_to_data_url(full_path)
-                    if data_url:
-                        content = data_url
-                        voice_count += 1
-                    else:
-                        # 本地文件不存在，用 CDN URL
-                        urls = cj["resource_url"].get("url_list", [])
-                        content = urls[0] if urls else f"[语音 {dur_sec}秒]"
-                elif cj["resource_url"].get("url_list"):
-                    content = cj["resource_url"]["url_list"][0]
-                else:
-                    content = f"[语音 {dur_sec}秒]"
-
-            # 图片/表情：优先 CDN URL
-            if not is_voice and chatlab_type in (1, 5):
+            # 表情：用文字标签代替 URL — CDN 早晚过期，URL 对 LLM 也没意义。
+            # 从 URL 路径里反解出表情名（如 [续火花]）。
+            if not is_voice and chatlab_type == 5:
+                content = _emoji_text_label(content, msg["media_url"])
+                emoji_count += 1
+            # 图片：优先 CDN URL，本地文件 fallback 为 base64
+            elif not is_voice and chatlab_type == 1:
                 if msg["media_url"]:
                     content = msg["media_url"]
                     image_count += 1
@@ -244,11 +336,13 @@ class ChatLabExporter:
                         chatlab_type = 0
                     image_count += 1
 
-            # 分享消息：附加 URL
-            if chatlab_type == 24 and cj:
+            # 分享消息：以 cj 的形态判断（含 itemId），不依赖 msg_type ——
+            # 实测有 ~2300 条 share 被错分类成 msg_type=1 (TEXT)，content 直接是 aweme JSON 漏出来。
+            # 不要放宽到 aweType / content_title 等字段 —— 表情消息的 cj 也带这些。
+            if not is_voice and cj and cj.get("itemId"):
                 item_id = cj.get("itemId", "")
-                title = cj.get("content_title", "")
-                author = cj.get("content_name", "")
+                title = (cj.get("content_title") or "").strip()
+                author = (cj.get("content_name") or "").strip()
                 parts = []
                 if title:
                     parts.append(title)
@@ -256,8 +350,20 @@ class ChatLabExporter:
                     parts.append(f"@{author}")
                 if item_id:
                     parts.append(f"https://www.douyin.com/video/{item_id}")
-                if parts:
-                    content = " | ".join(parts)
+                content = "[分享视频] " + " | ".join(parts) if parts else "[分享视频]"
+                chatlab_type = 24  # SHARE，统一类型
+                share_normalized += 1
+
+            # 系统消息（msg_type=0 但不是语音 / 不是 share）：模板 JSON 渲染成可读文字
+            elif not is_voice and msg["msg_type"] == 0:
+                content = _system_message_text(content, cj)
+                if chatlab_type == 99:
+                    chatlab_type = 0  # TEXT
+                system_count += 1
+
+            # 最终兜底：还是 JSON 的内容（极少数 awemeType 都缺的）统一收敛
+            if isinstance(content, str) and content.startswith("{") and content.endswith("}"):
+                content = "[分享内容]"
 
             chatlab_msg = {
                 "sender": uid,
@@ -316,9 +422,15 @@ class ChatLabExporter:
         print(f"  消息: {len(chatlab_messages)}")
         print(f"  成员: {len(members)}")
         if image_count:
-            print(f"  图片/表情: {image_count} (嵌入 data URL: {image_embedded})")
+            print(f"  图片: {image_count} (嵌入 data URL: {image_embedded})")
+        if emoji_count:
+            print(f"  表情: {emoji_count} (转为文字标签)")
         if voice_count:
-            print(f"  语音: {voice_count} (嵌入 data URL)")
+            print(f"  语音: {voice_count} (转为文字标签)")
+        if system_count:
+            print(f"  系统消息: {system_count} (模板渲染为文字)")
+        if share_normalized:
+            print(f"  分享视频: {share_normalized} (含 type=1 错分类的)")
         if ref_count:
             print(f"  引用/回复: {ref_count}")
         size_mb = os.path.getsize(output_path) / (1024 * 1024)
