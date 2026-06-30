@@ -1,34 +1,29 @@
-"""Backfill self-recorded video MP4 files via the IM batch_play_info API.
+"""Backfill self-recorded IM videos.
 
-Discovery (see tools/probe_video_url.py history):
-  POST https://www.douyin.com/aweme/v1/web/maya/story/batch_play_info/v1/
-  Body: {"req_infos":[{"item_id":0,"tos_key":"vid-...","type":2},...],"with_caption":true}
-  Resp: {"data":{"play_infos":[{"encrypted_url":{"main_url":"https://...douyinvod.com/.../?biz_tag=aweme_im&..."},
-                                  "original_encrypted_url":{"main_url":"...","data_size":1528396}},...]}}
+Flow:
+  1. Playwright opens /chat once (loads session cookies + warms SDK).
+  2. POST /aweme/v1/web/maya/story/batch_play_info/v1/ in page context
+     to batch-resolve N tos_keys → signed CDN URLs (~10 vids per call).
+  3. urllib downloads the encrypted bytes from each URL.
+  4. extractor.cenc decrypts the MPEG-CENC AES-128-CTR samples in-place
+     using cj.video.skey (16 bytes), giving a playable mp4.
+  5. Save to data/media/videos/<msg_id>.mp4 and update DB.
 
-The URL is signed but server returns ~1h expiry. Cookies alone authenticate;
-msToken/a_bogus are NOT required when calling from the page context (or any
-context with the login cookie).
-
-Strategy:
-  1. Open Playwright once → /chat (loads cookies + SDK warm-up)
-  2. Batch DB vids in groups of N → page.evaluate(fetch) → get URLs
-  3. Download each MP4 directly via urllib, save to data/media/videos/<server_id>.mp4
-  4. Update messages.media_local_path
+No UI scrolling, no clicking, no Web Worker, no wasm. Just HTTPS + Python.
 """
 import asyncio
 import json
 import os
 import sqlite3
 import sys
-import time
-import urllib.request
 import urllib.error
+import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from extractor.web_scraper import WebChatScraper
 from extractor.models import get_db
+from extractor.cenc import decrypt_cenc_mp4
 
 
 VIDEOS_DIR = os.path.join(
@@ -44,13 +39,21 @@ BATCH_API_PATH = (
 )
 
 
-def pending_videos(conn, conv_id=None, limit=None):
-    """List video messages missing a local mp4.
+def _msg_video(msg) -> dict | None:
+    """Returns cj.video dict if present (has tkey + skey)."""
+    try:
+        ro = json.loads(msg["raw_data"])
+        cj = json.loads(ro.get("content_json", "{}"))
+        v = cj.get("video") or {}
+        if v.get("tkey") and v.get("skey"):
+            return v
+    except Exception:
+        pass
+    return None
 
-    The SQL pre-filter is broad (any 'tkey' anywhere in raw_data), which
-    catches text replies whose ref_msg quotes a video — we then drop those
-    in Python by requiring cj.video.tkey to actually exist on the message.
-    """
+
+def pending_videos(conn, conv_id=None, limit=None):
+    """Video messages missing a working local mp4 (with cj.video.tkey present)."""
     sql = """SELECT msg_id, conv_id, timestamp, raw_data, media_local_path
              FROM messages
              WHERE (msg_type = 5 OR (raw_data LIKE '%tkey%' AND raw_data LIKE '%poster%'))
@@ -62,26 +65,23 @@ def pending_videos(conn, conv_id=None, limit=None):
         args.append(conv_id)
     sql += " ORDER BY timestamp DESC"
     rows = conn.execute(sql, args).fetchall()
-
-    # Filter: must have cj.video.tkey (excludes text replies whose ref_msg
-    # contains a quoted video).
     out = []
     for r in rows:
-        if _msg_tkey(r):
+        if _msg_video(r):
             out.append(r)
             if limit and len(out) >= limit:
                 break
     return out
 
 
-def _msg_tkey(msg) -> str | None:
-    """Extract video tkey ('vid-xxx') from a message row."""
-    try:
-        ro = json.loads(msg["raw_data"])
-        cj = json.loads(ro.get("content_json", "{}"))
-        return (cj.get("video") or {}).get("tkey")
-    except Exception:
-        return None
+def reset_local_paths(conn):
+    """Clear media_local_path for all video messages so they re-enter pending."""
+    cur = conn.execute(
+        """UPDATE messages SET media_local_path = NULL
+           WHERE media_local_path LIKE 'videos/%.mp4'"""
+    )
+    conn.commit()
+    return cur.rowcount
 
 
 def _download(url: str, timeout: int = 60) -> bytes:
@@ -93,37 +93,8 @@ def _download(url: str, timeout: int = 60) -> bytes:
         return r.read()
 
 
-def _faststart_mp4(path: str) -> None:
-    """Rewrite mp4 in-place to put moov at the front, so browsers can play it
-    without buffering the whole file. Douyin's CDN serves unfaststart mp4
-    (moov at end), which the HTML5 <video> element refuses to play.
-
-    Uses ffmpeg `-movflags faststart`; no re-encode — just container remux.
-    Silently no-ops if ffmpeg is missing.
-    """
-    import shutil
-    import subprocess
-    if not shutil.which("ffmpeg"):
-        return
-    tmp = path + ".faststart.mp4"
-    try:
-        proc = subprocess.run(
-            ["ffmpeg", "-y", "-loglevel", "error", "-i", path,
-             "-c", "copy", "-movflags", "+faststart", tmp],
-            capture_output=True, timeout=60,
-        )
-        if proc.returncode == 0 and os.path.exists(tmp) and os.path.getsize(tmp) > 0:
-            os.replace(tmp, path)
-        else:
-            try: os.remove(tmp)
-            except OSError: pass
-    except Exception:
-        try: os.remove(tmp)
-        except OSError: pass
-
-
 async def _resolve_batch(page, tkeys: list[str]) -> dict[str, str]:
-    """Resolve a batch of tos_keys to main_url. Returns {tkey: url} for successful ones."""
+    """Resolve a batch of tkeys → main_url. Returns {tkey: url}."""
     result = await page.evaluate(
         r"""async ({path, tkeys}) => {
             try {
@@ -136,8 +107,7 @@ async def _resolve_batch(page, tkeys: list[str]) -> dict[str, str]:
                     headers: { 'Content-Type': 'application/json' },
                     body,
                 });
-                const text = await r.text();
-                return { status: r.status, body: text };
+                return { status: r.status, body: await r.text() };
             } catch (e) { return { err: String(e) }; }
         }""", {"path": BATCH_API_PATH, "tkeys": tkeys},
     )
@@ -150,7 +120,6 @@ async def _resolve_batch(page, tkeys: list[str]) -> dict[str, str]:
     if payload.get("err_no") != 0:
         return {}
     out = {}
-    # response play_infos is ordered same as req_infos
     infos = (payload.get("data") or {}).get("play_infos") or []
     for tkey, info in zip(tkeys, infos):
         eu = (info or {}).get("encrypted_url") or {}
@@ -160,9 +129,44 @@ async def _resolve_batch(page, tkeys: list[str]) -> dict[str, str]:
     return out
 
 
+def _faststart_mp4(path: str) -> None:
+    """Move moov to the front so HTML5 <video> can start playback without
+    reading the whole file. ffmpeg remux only — no re-encode."""
+    import shutil
+    import subprocess
+    if not shutil.which("ffmpeg"):
+        return
+    tmp = path + ".faststart.mp4"
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", path,
+             "-c", "copy", "-movflags", "+faststart", "-f", "mp4", tmp],
+            capture_output=True, timeout=60,
+        )
+        if proc.returncode == 0 and os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+            os.replace(tmp, path)
+        else:
+            try: os.remove(tmp)
+            except OSError: pass
+    except Exception:
+        try: os.remove(tmp)
+        except OSError: pass
+
+
+def _process_one(enc_bytes: bytes, skey_hex: str, out_path: str) -> int:
+    """Decrypt + save (with moov-at-front faststart). Returns size on disk."""
+    if len(enc_bytes) < 1024 or enc_bytes[4:8] != b'ftyp':
+        raise ValueError(f"bad mp4 ({len(enc_bytes)}B magic={enc_bytes[:8].hex()})")
+    plain = decrypt_cenc_mp4(enc_bytes, skey_hex)
+    with open(out_path, "wb") as f:
+        f.write(plain)
+    # In-place CENC decrypt preserves the unfaststart layout; remux to put moov first.
+    _faststart_mp4(out_path)
+    return os.path.getsize(out_path)
+
+
 async def backfill(conv_id: str | None = None, limit: int | None = None,
                    batch_size: int = BATCH_SIZE, progress_cb=None) -> dict:
-    """Backfill all pending videos. Returns summary dict."""
     os.makedirs(VIDEOS_DIR, exist_ok=True)
     conn = get_db()
 
@@ -171,101 +175,98 @@ async def backfill(conv_id: str | None = None, limit: int | None = None,
     if not pending:
         return {"total": 0, "ok": 0, "fail": 0, "skipped": 0, "log": log}
 
-    # Group by tkey availability
-    msgs_by_tkey = {}
-    no_tkey = 0
+    # Group by tkey (one tkey may map to multiple msg_ids if forwarded)
+    by_tkey: dict[str, list[tuple[str, str]]] = {}  # tkey → [(msg_id, skey)...]
     for m in pending:
-        tk = _msg_tkey(m)
-        if not tk:
-            no_tkey += 1
+        v = _msg_video(m)
+        if not v:
             continue
-        msgs_by_tkey.setdefault(tk, []).append(m)
-    log.append(f"[*] {no_tkey} skipped (no tkey in cj)")
-    log.append(f"[*] {len(msgs_by_tkey)} unique tkeys to resolve")
+        by_tkey.setdefault(v["tkey"], []).append((m["msg_id"], v["skey"]))
+
+    log.append(f"[*] {len(by_tkey)} unique tkeys")
 
     ok = 0
     fail = 0
-    skipped = no_tkey
+    skipped = 0
+    total = len(pending)
 
     s = WebChatScraper()
     await s.launch()
     if not await s.wait_for_login():
         log.append("[-] login required")
-        return {"total": len(pending), "ok": 0, "fail": 0,
-                "skipped": skipped, "log": log}
+        return {"total": total, "ok": 0, "fail": 0, "skipped": 0, "log": log}
     page = s.page
 
-    log.append("[*] warming SDK at /chat ...")
+    log.append("[*] warming SDK at /chat")
     await page.goto("https://www.douyin.com/chat", wait_until="commit", timeout=30000)
     await asyncio.sleep(6)
 
-    tkeys = list(msgs_by_tkey.keys())
-    log.append(f"[*] resolving in batches of {batch_size} ...")
+    log.append(f"[*] resolving + decrypting in batches of {batch_size}")
+    tkeys = list(by_tkey.keys())
 
     for batch_idx in range(0, len(tkeys), batch_size):
         batch = tkeys[batch_idx:batch_idx + batch_size]
         urls = await _resolve_batch(page, batch)
-        log.append(f"  batch {batch_idx//batch_size + 1}: requested {len(batch)} → resolved {len(urls)}")
+        log.append(f"  batch {batch_idx//batch_size + 1}: {len(batch)} req → {len(urls)} URL")
 
-        # Download each URL, save under each owning msg's server_id
-        for tk in batch:
-            for msg in msgs_by_tkey[tk]:
-                sid = msg["msg_id"]
-                out_rel = f"videos/{sid}.mp4"
-                out_abs = os.path.join(VIDEOS_DIR, f"{sid}.mp4")
-                if os.path.exists(out_abs):
+        for tkey in batch:
+            url = urls.get(tkey)
+            for msg_id, skey in by_tkey[tkey]:
+                out_rel = f"videos/{msg_id}.mp4"
+                out_abs = os.path.join(VIDEOS_DIR, f"{msg_id}.mp4")
+                if os.path.exists(out_abs) and os.path.getsize(out_abs) > 0:
                     conn.execute("UPDATE messages SET media_local_path=? WHERE msg_id=?",
-                                 (out_rel, sid))
+                                 (out_rel, msg_id))
                     conn.commit()
                     skipped += 1
                     continue
-                url = urls.get(tk)
                 if not url:
                     fail += 1
-                    log.append(f"    [-] {sid}: no URL from resolver")
+                    log.append(f"    [-] {msg_id}: no URL from resolver")
                     continue
                 try:
-                    data = await asyncio.to_thread(_download, url, 60)
-                    if len(data) < 1024 or data[4:8] != b'ftyp':
-                        raise ValueError(f"bad mp4 ({len(data)}B magic={data[:8].hex()})")
-                    with open(out_abs, "wb") as f:
-                        f.write(data)
-                    # moov-at-end → moov-at-start so browsers can play it
-                    await asyncio.to_thread(_faststart_mp4, out_abs)
+                    enc = await asyncio.to_thread(_download, url, 60)
+                    size = await asyncio.to_thread(_process_one, enc, skey, out_abs)
                     conn.execute("UPDATE messages SET media_local_path=? WHERE msg_id=?",
-                                 (out_rel, sid))
+                                 (out_rel, msg_id))
                     conn.commit()
                     ok += 1
+                    log.append(f"    [+] {msg_id} ({size//1024} KB)")
                 except Exception as e:
                     fail += 1
-                    log.append(f"    [-] {sid}: download failed: {e}")
+                    log.append(f"    [-] {msg_id}: {e}")
                 if progress_cb:
-                    progress_cb({"ok": ok, "fail": fail, "skipped": skipped,
-                                 "total": len(pending), "current": sid})
+                    progress_cb({
+                        "ok": ok, "fail": fail, "skipped": skipped,
+                        "total": total, "current": msg_id,
+                    })
 
-    try: await asyncio.wait_for(s.close(), timeout=10)
-    except Exception: pass
+    try:
+        await asyncio.wait_for(s.close(), timeout=10)
+    except Exception:
+        pass
 
     log.append(f"[+] done: ok={ok} fail={fail} skipped={skipped}")
-    return {"total": len(pending), "ok": ok, "fail": fail,
+    return {"total": total, "ok": ok, "fail": fail,
             "skipped": skipped, "log": log}
 
 
 async def main():
     """CLI:
-      backfill all pending: `python -m extractor.video_downloader`
-      backfill N: `python -m extractor.video_downloader N`
-      faststart fix on existing files: `python -m extractor.video_downloader --faststart`
+      backfill all pending:  `python -m extractor.video_downloader`
+      backfill N:            `python -m extractor.video_downloader N`
+      reset DB+files:        `python -m extractor.video_downloader --reset`
     """
-    if len(sys.argv) > 1 and sys.argv[1] == "--faststart":
-        files = [f for f in os.listdir(VIDEOS_DIR) if f.endswith(".mp4")] if os.path.isdir(VIDEOS_DIR) else []
-        print(f"[*] faststart pass over {len(files)} existing files", flush=True)
-        for i, f in enumerate(files):
-            p = os.path.join(VIDEOS_DIR, f)
-            _faststart_mp4(p)
-            if (i+1) % 10 == 0 or i+1 == len(files):
-                print(f"  → {i+1}/{len(files)}", flush=True)
-        print("[+] done")
+    if len(sys.argv) > 1 and sys.argv[1] == "--reset":
+        conn = get_db()
+        n = reset_local_paths(conn)
+        print(f"[*] cleared media_local_path on {n} rows")
+        if os.path.isdir(VIDEOS_DIR):
+            files = [f for f in os.listdir(VIDEOS_DIR) if f.endswith(".mp4")]
+            for f in files:
+                try: os.unlink(os.path.join(VIDEOS_DIR, f))
+                except OSError: pass
+            print(f"[*] deleted {len(files)} mp4 files")
         return
 
     limit = None
@@ -274,11 +275,11 @@ async def main():
         except ValueError: pass
 
     def cb(p):
-        print(f"  → ok={p['ok']} fail={p['fail']} skipped={p['skipped']} / {p['total']} (last: {p['current']})", flush=True)
+        print(f"  → ok={p['ok']} fail={p['fail']} skipped={p['skipped']} / {p['total']}", flush=True)
 
     result = await backfill(limit=limit, progress_cb=cb)
-    print("\n=== log ===")
-    for line in result["log"][-25:]:
+    print("\n=== log (tail) ===")
+    for line in result["log"][-15:]:
         print(line)
     print(f"\n=== summary ===")
     print(f"  total={result['total']} ok={result['ok']} fail={result['fail']} skipped={result['skipped']}")

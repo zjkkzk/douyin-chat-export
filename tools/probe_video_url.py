@@ -1,75 +1,145 @@
-"""Test: can we call batch_play_info from page context with arbitrary vids?
-No scrolling needed if yes."""
+"""Intercept Blob constructions and save the JS source of any text/javascript blob
+that's >100KB — that's the decryption Worker."""
 import asyncio
-import json
 import os
-import sqlite3
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from extractor.web_scraper import WebChatScraper
 
-
-def some_vids(n=3):
-    c = sqlite3.connect("data/chat.db"); c.row_factory = sqlite3.Row
-    out = []
-    for r in c.execute("SELECT raw_data FROM messages WHERE raw_data LIKE '%tkey%' ORDER BY timestamp DESC LIMIT 50"):
-        try:
-            ro = json.loads(r[0])
-            if ro.get("awe_type") != 0: continue
-            cj = json.loads(ro.get("content_json", "{}"))
-            tkey = cj.get("video", {}).get("tkey")
-            vid = cj.get("video", {}).get("vid")
-            if tkey: out.append({"tkey": tkey, "vid": vid})
-            if len(out) >= n: break
-        except Exception: pass
-    return out
+TARGET_TEXT = "我变成狗了"
 
 
 async def main():
-    vids = some_vids(5)
-    print(f"[*] testing with {len(vids)} vids:", flush=True)
-    for v in vids: print(f"    tkey={v['tkey']}")
-
     s = WebChatScraper()
     await s.launch()
     await s.wait_for_login()
     page = s.page
 
-    print("\n[*] open /chat (just to load SDK + cookies + tokens) ...", flush=True)
+    await page.add_init_script(
+        r"""
+        window.__cap__ = { worker_sources: [], errs: [] };
+
+        // Hook Blob constructor — keep the JS source if it's text/javascript
+        try {
+        const _Blob = window.Blob;
+        function NewBlob(parts, opts) {
+            try {
+                const type = (opts && opts.type) || '';
+                if (type.startsWith('text/javascript') || type === '') {
+                    let totalLen = 0;
+                    for (const p of (parts || [])) {
+                        if (typeof p === 'string') totalLen += p.length;
+                        else if (p && p.byteLength) totalLen += p.byteLength;
+                    }
+                    if (totalLen > 10000 && totalLen < 1_000_000) {
+                        // Likely a worker source
+                        let source = '';
+                        for (const p of (parts || [])) {
+                            if (typeof p === 'string') source += p;
+                            else if (p && p.byteLength) {
+                                // decode bytes as text
+                                source += new TextDecoder().decode(p);
+                            }
+                        }
+                        window.__cap__.worker_sources.push({
+                            total: totalLen, type,
+                            head: source.slice(0, 200), tail: source.slice(-200),
+                            full: source  // 不截断
+                        });
+                    }
+                }
+            } catch (e) { window.__cap__.errs.push('blob hook: ' + e); }
+            return new _Blob(parts, opts);
+        }
+        NewBlob.prototype = _Blob.prototype;
+        window.Blob = NewBlob;
+        } catch (e) { window.__cap__.errs.push('blob: ' + e); }
+        """
+    )
+
+    print("[*] open + switch conv ...", flush=True)
     await page.goto("https://www.douyin.com/chat", wait_until="commit", timeout=30000)
     await asyncio.sleep(8)
+    await page.locator('[class*="conversationConversationItem"]').first.click(force=True, timeout=10000)
+    await asyncio.sleep(8)
 
-    # === Direct fetch from page context, NO click, NO scroll ===
-    print("\n[*] calling batch_play_info via page.fetch with all vids batched ...", flush=True)
-    result = await page.evaluate(
-        r"""async (vids) => {
-            try {
-                // Build body
-                const body = JSON.stringify({
-                    req_infos: vids.map(v => ({ item_id: 0, tos_key: v.tkey, type: 2 })),
-                    with_caption: true,
-                });
-                // Hit the endpoint WITHOUT custom params — let the SDK's URL handling do its thing
-                // (cookies + SDK's request interceptor will add msToken/a_bogus)
-                const url = '/aweme/v1/web/maya/story/batch_play_info/v1/?device_platform=webapp&aid=6383&channel=channel_pc_web&app_name=douyin_web&pc_client_type=1';
-                const resp = await fetch(url, {
-                    method: 'POST',
-                    credentials: 'include',
-                    headers: { 'Content-Type': 'application/json' },
-                    body,
-                });
-                const text = await resp.text();
-                return { status: resp.status, body: text.slice(0, 3000) };
-            } catch (e) {
-                return { err: String(e) };
+    print(f"[*] scroll to target ...", flush=True)
+    await page.mouse.move(700, 400)
+    for _ in range(300):
+        ok = await page.evaluate(
+            r"""(n) => {
+                const tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                let nd;
+                while (nd = tw.nextNode()) {
+                    if (nd.nodeValue?.includes(n)) {
+                        const el = nd.parentElement;
+                        if (el && el.getBoundingClientRect().left > 350) return true;
+                    }
+                }
+                return false;
+            }""", TARGET_TEXT
+        )
+        if ok: break
+        await page.mouse.wheel(0, -300)
+        await asyncio.sleep(0.4)
+    await page.evaluate(
+        r"""(n) => {
+            const tw = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+            let nd;
+            while (nd = tw.nextNode()) {
+                if (nd.nodeValue?.includes(n)) {
+                    nd.parentElement.scrollIntoView({block:'center'}); return;
+                }
             }
-        }""", vids,
+        }""", TARGET_TEXT
     )
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    await asyncio.sleep(3)
 
-    try: await asyncio.wait_for(s.close(), timeout=10)
-    except Exception: pass
+    box = await page.evaluate(
+        r"""() => {
+            const b = document.querySelector('[class*="MessageItemVideo"][class*="videoBox"]');
+            if (!b) return null;
+            const r = b.getBoundingClientRect();
+            return { x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2) };
+        }"""
+    )
+
+    # 不要 reset —— worker 是页面加载时就构造的
+    pre_count = await page.evaluate("window.__cap__.worker_sources.length")
+    print(f"[*] 进入下载前已捕获 {pre_count} 个候选", flush=True)
+    await page.mouse.click(box["x"], box["y"], button="right")
+    await asyncio.sleep(1)
+    dl = await page.evaluate(
+        r"""() => {
+            const popup = document.querySelector('[class*="MessageOperatePopWindow"][class*="wrapper"]');
+            if (!popup) return null;
+            let t = null;
+            popup.querySelectorAll('[class*="MessageOperatePopBody"][class*="buttonItem"]').forEach(el => {
+                if (el.textContent.trim() === '下载') t = el;
+            });
+            if (!t) return null;
+            const r = t.getBoundingClientRect();
+            return { x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2) };
+        }"""
+    )
+    print(f"[*] click 下载", flush=True)
+    await page.mouse.click(dl["x"], dl["y"])
+    await asyncio.sleep(10)
+
+    cap = await page.evaluate("window.__cap__")
+    print(f"\n=== {len(cap['worker_sources'])} blob 候选 ===")
+    for i, w in enumerate(cap['worker_sources']):
+        print(f"\n--- worker[{i}] size={w['total']} type={w['type']!r} ---")
+        print(f"head: {w['head'][:300]!r}")
+        print(f"tail: {w['tail'][:150]!r}")
+        # 保存
+        with open(f"/tmp/worker_{i}.js", "w") as f:
+            f.write(w['full'])
+        print(f"  → /tmp/worker_{i}.js saved {len(w['full'])} bytes")
+
+    print(f"\n=== errs: {cap['errs']} ===")
+    await s.close()
 
 
 if __name__ == "__main__":
