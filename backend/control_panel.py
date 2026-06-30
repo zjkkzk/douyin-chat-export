@@ -413,15 +413,14 @@ async def video_backfill_status():
 
 @control_router.get("/api/media/videos/pending")
 async def video_backfill_pending():
+    # Reuse the same Python filter as the backfill itself so the count matches
+    # what will actually be processed (excludes text replies that quote a video).
+    from extractor.video_downloader import pending_videos
     from backend.database import get_db
     conn = get_db()
-    n = conn.execute(
-        "SELECT COUNT(*) FROM messages "
-        "WHERE (msg_type = 5 OR (raw_data LIKE '%tkey%' AND raw_data LIKE '%poster%')) "
-        "AND (media_local_path IS NULL OR media_local_path = '' OR media_local_path NOT LIKE '%.mp4')"
-    ).fetchone()[0]
+    rows = pending_videos(conn)
     conn.close()
-    return {"pending": n}
+    return {"pending": len(rows)}
 
 
 @control_router.post("/api/media/videos/backfill")

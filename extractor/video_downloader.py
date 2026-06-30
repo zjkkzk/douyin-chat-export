@@ -45,7 +45,12 @@ BATCH_API_PATH = (
 
 
 def pending_videos(conn, conv_id=None, limit=None):
-    """List video messages missing a local mp4."""
+    """List video messages missing a local mp4.
+
+    The SQL pre-filter is broad (any 'tkey' anywhere in raw_data), which
+    catches text replies whose ref_msg quotes a video — we then drop those
+    in Python by requiring cj.video.tkey to actually exist on the message.
+    """
     sql = """SELECT msg_id, conv_id, timestamp, raw_data, media_local_path
              FROM messages
              WHERE (msg_type = 5 OR (raw_data LIKE '%tkey%' AND raw_data LIKE '%poster%'))
@@ -56,10 +61,17 @@ def pending_videos(conn, conv_id=None, limit=None):
         sql += " AND conv_id = ?"
         args.append(conv_id)
     sql += " ORDER BY timestamp DESC"
-    if limit:
-        sql += " LIMIT ?"
-        args.append(limit)
-    return conn.execute(sql, args).fetchall()
+    rows = conn.execute(sql, args).fetchall()
+
+    # Filter: must have cj.video.tkey (excludes text replies whose ref_msg
+    # contains a quoted video).
+    out = []
+    for r in rows:
+        if _msg_tkey(r):
+            out.append(r)
+            if limit and len(out) >= limit:
+                break
+    return out
 
 
 def _msg_tkey(msg) -> str | None:
