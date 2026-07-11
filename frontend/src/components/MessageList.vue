@@ -232,7 +232,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, watch, nextTick, onMounted, onUnmounted } from 'vue'
+import { ref, reactive, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import { highlightText as _highlightText } from '@/lib/highlight'
 import { resolveAvatarUrl } from '@/lib/media'
 import MessageLightbox from './MessageLightbox.vue'
@@ -291,6 +291,12 @@ function isGroupStart(index) {
   return Math.abs((cur.timestamp || 0) - (prev.timestamp || 0)) > 300  // >5 min
 }
 
+// 单聊的 conv_id 形如 "0:1:uidA:uidB"，群聊是纯数字雪花 ID。
+const isGroupConv = computed(() => {
+  const id = props.conversation?.conv_id || ''
+  return !!id && !id.includes(':')
+})
+
 function displayName(msg) {
   if (selfUid.value && msg.sender_uid === selfUid.value) {
     const u = userCache[msg.sender_uid]
@@ -299,6 +305,11 @@ function displayName(msg) {
   const u = userCache[msg.sender_uid]
   if (u?.nickname) return u.nickname
   if (msg.sender_name && msg.sender_name !== '__self__') return msg.sender_name
+  // 群聊里回退成会话名 = 把每个不认识的成员都显示成群名，不同的人会糊成同一个。
+  // 单聊没这个问题（会话名就是对方昵称）。
+  if (isGroupConv.value) {
+    return msg.sender_uid ? `用户${msg.sender_uid.slice(-6)}` : '群成员'
+  }
   return props.conversation?.name || '对方'
 }
 

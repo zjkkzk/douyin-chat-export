@@ -22,12 +22,18 @@ if sys.platform == 'win32':
 
 from playwright.async_api import async_playwright
 
+from common import paths
 from extractor.models import (
     init_db, get_db, upsert_user, upsert_conversation, update_conversation_stats,
 )
 
 CHAT_URL = "https://www.douyin.com/chat?isPopup=1"
 USER_DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "browser_profile")
+
+# IM 用户信息接口：POST sec_user_ids=<JSON 数组> → {data: [{uid, nickname, unique_id, avatar_thumb}]}
+# 只认 cookies，不需要 msToken/a_bogus（与 batch_play_info 同理）。
+USER_INFO_API = "https://www.douyin.com/aweme/v1/web/im/user/info/"
+BATCH_USER_INFO = 20
 
 # ── DOM Selectors (from discovery) ──────────────────────────────
 # Conversation list
@@ -886,10 +892,16 @@ class WebChatScraper:
             print(f"  [*] 未能从 userInfoStore 获取用户信息")
             return
 
-        avatar_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "media", "avatars")
+        saved = await self._save_users(users)
+        print(f"  [*] 已保存 {saved} 个用户信息")
+
+    async def _save_users(self, users):
+        """下载头像到本地并落库。users: [{uid, nickname, unique_id, avatar_url}]。"""
+        avatar_dir = paths.AVATARS_DIR
         os.makedirs(avatar_dir, exist_ok=True)
 
         conn = self._db_conn
+        saved = 0
         for u in users:
             uid = u.get("uid", "")
             if not uid:
@@ -931,9 +943,67 @@ class WebChatScraper:
             upsert_user(conn, uid, nickname=nickname,
                         avatar_url=local_avatar or avatar_url,
                         unique_id=unique_id)
+            saved += 1
 
         conn.commit()
-        print(f"  [*] 已保存 {len(users)} 个用户信息")
+        return saved
+
+    async def _resolve_sender_identities(self, sec_by_uid):
+        """按 sec_uid 批量补全发送者昵称/头像。
+
+        `userInfoStore` 只缓存 SDK 渲染过的用户——单聊够用，群聊远远不够：纯 API
+        模式压根不渲染历史消息，绝大多数群成员因此从来没进过 users 表，前端只能
+        回退成会话名，于是所有人都显示成群名（issue #24）。
+
+        消息 protobuf 的 field 14 是该条消息发送者的 sec_uid，拿它调 IM 的用户信息
+        接口即可补全。接口只认 cookies（不需要 msToken/a_bogus），sec_user_ids 是
+        JSON 数组，一次可查多个。
+        """
+        known = self._known_user_uids()
+        pending = {uid: sec for uid, sec in sec_by_uid.items() if uid not in known}
+        if not pending:
+            return
+
+        print(f"  [*] 补全 {len(pending)} 个发送者的昵称/头像...")
+        sec_list = list(pending.values())
+        total = 0
+        for i in range(0, len(sec_list), BATCH_USER_INFO):
+            batch = sec_list[i:i + BATCH_USER_INFO]
+            try:
+                users = await self.page.evaluate("""async (args) => {
+                    const [api, secs] = args;
+                    const r = await fetch(api, {
+                        method: 'POST',
+                        credentials: 'include',
+                        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                        body: 'sec_user_ids=' + encodeURIComponent(JSON.stringify(secs)),
+                    });
+                    if (!r.ok) return [];
+                    const j = await r.json();
+                    return (j.data || []).map(u => ({
+                        uid: String(u.uid || ''),
+                        nickname: u.nickname || '',
+                        unique_id: u.unique_id || '',
+                        avatar_url: (u.avatar_thumb && u.avatar_thumb.url_list
+                                     && u.avatar_thumb.url_list[0]) || '',
+                    })).filter(u => u.uid && u.nickname);
+                }""", [USER_INFO_API, batch])
+            except Exception as e:
+                print(f"  [!] 补全发送者失败 (batch {i // BATCH_USER_INFO + 1}): {e}")
+                continue
+            if users:
+                total += await self._save_users(users)
+            await asyncio.sleep(0.3)
+
+        print(f"  [*] 已补全 {total}/{len(pending)} 个发送者信息")
+
+    def _known_user_uids(self):
+        """users 表里已有昵称的 uid（没昵称的等同于没有，需要补全）。"""
+        return {
+            row[0] for row in self._db_conn.execute(
+                "SELECT uid FROM users WHERE nickname IS NOT NULL AND nickname != ''"
+            )
+        }
 
     async def _extract_and_save_conv_avatar(self, conv_id):
         """从当前激活会话的列表项 DOM 抓取头像，下载到本地，写入会话表。"""
@@ -1354,6 +1424,9 @@ class WebChatScraper:
                         const slice = buf.slice(pos, pos+len);
                         if (fn===1) r.conv_id=new TextDecoder().decode(slice);
                         else if (fn===8) { try { r.content_json=new TextDecoder().decode(slice); } catch {} }
+                        // Field 14: 发送者 sec_uid。群聊补全昵称/头像的唯一线索——
+                        // IM 用户信息接口只认 sec_uid，不认 f7 的数字 uid。
+                        else if (fn===14) { try { r.sender_sec_uid=new TextDecoder().decode(slice); } catch {} }
                         else if (fn===18) {
                             // Field 18: 引用/回复消息
                             // 结构: f1=被引用消息server_id, f2=JSON(content, nickname, refmsg_sec_uid, refmsg_content)
@@ -1485,6 +1558,7 @@ class WebChatScraper:
                 print(f"  [*] 增量模式: 已有 {existing_count} 条消息")
 
         # 4. 循环分页获取所有消息
+        sec_by_uid = {}  # sender_uid -> sec_uid，抓完后批量补全昵称/头像
         total_saved = 0
         total_fetched = 0
         batch_num = 0
@@ -1548,6 +1622,8 @@ class WebChatScraper:
             # 转换 API 消息格式 → _store_messages 期望的格式
             converted = []
             for m in msgs:
+                if m.get("sender_uid") and m.get("sender_sec_uid"):
+                    sec_by_uid.setdefault(m["sender_uid"], m["sender_sec_uid"])
                 content_json = m.get("content_json", "")
                 # 解析 content JSON
                 text = ""
@@ -1660,7 +1736,8 @@ class WebChatScraper:
                     "awe_type": awe_type,
                     "is_self": False,  # API 不直接给出，后面可从 sender_uid 判断
                     "sender_uid": m.get("sender_uid", ""),
-                    "sender_name": "",  # API 不返回名字
+                    "sender_sec_uid": m.get("sender_sec_uid", ""),
+                    "sender_name": "",  # API 不返回名字，抓完后按 sec_uid 批量补全
                     "conversation_id": m.get("conv_id", conv_id),
                     "created_at": datetime.utcfromtimestamp(timestamp_sec).isoformat() + "Z" if timestamp_sec > 0 else "",
                     "order_high": created_at_us >> 32,
@@ -1709,7 +1786,13 @@ class WebChatScraper:
                 print(f"  [*] 已到达聊天记录起点")
                 break
 
-        # 5. 归一化 seq
+        # 5. 补全发送者身份（群聊必需）。失败不能影响已抓到的消息。
+        try:
+            await self._resolve_sender_identities(sec_by_uid)
+        except Exception as e:
+            print(f"  [!] 补全发送者信息失败: {e}")
+
+        # 6. 归一化 seq
         print(f"  [*] 归一化消息序号 (按服务端排序)...")
         rows = self._db_conn.execute(
             "SELECT msg_id FROM messages WHERE conv_id = ? ORDER BY seq ASC",
