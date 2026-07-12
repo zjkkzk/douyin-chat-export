@@ -1081,9 +1081,11 @@ async function loadLog() {
     const r = await fetch('/panel/api/scrape/log?lines=80');
     const d = await r.json();
     const box = document.getElementById('scrapeLog');
+    // 只有用户本来就贴着底部时才自动跟随，否则轮询会把往上翻的用户拽回底部
+    const stick = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
     box.textContent = d.log || t('noOutput');
     box.classList.add('show');
-    box.scrollTop = box.scrollHeight;
+    if (stick) box.scrollTop = box.scrollHeight;
   } catch {}
 }
 
@@ -1094,9 +1096,10 @@ async function loadDiscoverLog() {
     const box = document.getElementById('discoverLog');
     if (!box) return;
     if (d.log) {
+      const stick = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
       box.textContent = d.log;
       box.classList.add('show');
-      box.scrollTop = box.scrollHeight;
+      if (stick) box.scrollTop = box.scrollHeight;
     } else {
       box.classList.remove('show');
     }
