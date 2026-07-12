@@ -35,6 +35,12 @@ USER_DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data",
 USER_INFO_API = "https://www.douyin.com/aweme/v1/web/im/user/info/"
 BATCH_USER_INFO = 20
 
+# 滚动模式兜底退出：连续这么多轮一条新消息都没存下来就停。
+# 其余退出条件（scroll_stuck / oldest_time_stable）都是"连续计数"，虚拟列表一抖动
+# 就被清零；newly_inserted 是唯一单调的进度信号，没有它整个循环可能永不退出（#25）。
+# 阈值高于那两个（60/100），所以只在它们都够不着时才兜底。
+SCROLL_NO_NEW_LIMIT = 150
+
 # ── DOM Selectors (from discovery) ──────────────────────────────
 # Conversation list
 SEL_CONV_LIST = 'div[class*="conversationConversationListwrapper"]'
@@ -1974,6 +1980,20 @@ class WebChatScraper:
                     f"(共滚动 {scroll_round} 次, 保存 {total_saved} 条{idx_info})"
                 )
                 scroll_hit_ceiling = True
+                break
+
+            # 兜底退出：连续 N 轮一条新消息都没存下来 → 没有任何进展，再滚也是白滚。
+            # 上面两个条件都是连续计数，虚拟列表在两个位置间来回震荡（scrollTop
+            # 1944↔1655）会把它们反复清零，于是永远退不出去（issue #25）。
+            # newly_inserted 只有真的存进新消息才会重置，是唯一单调的进度信号。
+            if no_new_msg_rounds >= SCROLL_NO_NEW_LIMIT:
+                idx_info = f", 当前 idx=[{idx_min}~{idx_max}]" if idx_min is not None else ""
+                print(
+                    f"  [!] 停止滚动: 连续 {no_new_msg_rounds} 轮无新消息，无进展 "
+                    f"(共滚动 {scroll_round} 次, 保存 {total_saved} 条{idx_info})"
+                )
+                if total_saved == 0:
+                    print(f"  [!] 该会话一条消息都没抓到——可能是 DOM 结构变化或消息类型不支持")
                 break
 
             # ── 滚动策略 ──
