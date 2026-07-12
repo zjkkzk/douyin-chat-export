@@ -1117,88 +1117,140 @@ class WebChatScraper:
             mode_str = "增量" if self.incremental else "全量"
             print(f"  [*] 开始{mode_str}导出 (纯API模式)...")
 
-            # ── 纯 API 模式：清除 SDK 缓存 → 重新加载 → 捕获 cursor → API 直取全部消息 ──
+            # ── 纯 API 模式：拿到 short_id → API 直取全部消息 ──
+            # short_id 是 imapi 分页请求的 field 3。代码历史上误称它 "cursor"，实际是
+            # conversation_short_id（每会话固定）；真正翻页靠 field 5 的时间戳。
+            short_id = await self._acquire_short_id(conv_id, clean_name)
 
-            # 1. 清除 SDK 本地缓存（localStorage/sessionStorage/IndexedDB，保留 cookies 以维持登录）
-            print(f"  [*] 清除 SDK 本地缓存...")
-            await self._clear_sdk_cache()
+            if not short_id:
+                print(f"  [!] 未能获取 short_id，回退到滚动模式...")
+                scroll_saved, _ = await self._scroll_up_and_collect(conv_id, incremental=self.incremental)
+                print(f"  [+] 共保存 {scroll_saved} 条消息")
+                return
 
-            # 2. 安装请求拦截器（在重新加载之前，确保捕获 SDK 的第一个 API 请求）
-            self._captured_api_cursor = None
-            cursor_captured_event = asyncio.Event()
+            total_saved = await self._api_fetch_all_messages(
+                conv_id, short_id, incremental=self.incremental
+            )
+            print(f"  [+] 共保存 {total_saved} 条消息")
+        finally:
+            self._restore_conv_messages_if_empty(conv_id, backed_up)
 
-            async def capture_api_request(request):
-                if "get_by_conversation" in request.url and request.method == "POST":
-                    try:
-                        body = request.post_data_buffer
-                        if body:
-                            result = await self.page.evaluate("""(bytes) => {
-                                function dv(buf, pos) {
-                                    let r = 0n, s = 0n;
-                                    while (pos < buf.length) {
-                                        const b = buf[pos++]; r |= BigInt(b & 0x7F) << s;
-                                        if (!(b & 0x80)) break; s += 7n;
-                                    }
-                                    return [r, pos];
+    async def _acquire_short_id(self, conv_id, clean_name):
+        """拿到 imapi 分页请求需要的 short_id（field 3）。
+
+        - 群聊：纯数字 conv_id 本身就是 short_id（实测请求里 f3==conv_id），不依赖 SDK
+          任何时序，直接返回。旧代码对群聊也走"清缓存偷请求"，而群聊 SDK 有缓存时压根
+          不发 get_by_conversation → 偷不到 → 整条会话回退滚动 → 抓不到（issue #24/#25）。
+        - 单聊：conv_id 形如 '0:1:uidA:uidB'，short_id 是另一个数字，只能从 SDK 自己发的
+          get_by_conversation 请求里偷。带重试——这一步原本零重试，一次没偷到就回退滚动。
+        """
+        if conv_id.isdigit():
+            print(f"  [*] 群聊 short_id = conv_id ({conv_id})")
+            return conv_id
+
+        for attempt in range(3):
+            short_id = await self._steal_short_id_from_sdk(conv_id, clean_name)
+            if short_id:
+                return short_id
+            # 陌生人会话只有一条系统提示、消息列表不可滚动 → 结构上没有可翻页的历史，
+            # 再重试也偷不到。这类会话在"全量重抓"里成批出现，省掉多余的清缓存+重载。
+            si = await self._get_scroll_info()
+            if si and not si.get("scrollable"):
+                print(f"  [*] 会话无可翻页历史（消息列表不可滚动），停止重试")
+                break
+            if attempt < 2:
+                print(f"  [!] 第 {attempt + 1}/3 次未捕获到 short_id，重试...")
+        return None
+
+    async def _steal_short_id_from_sdk(self, conv_id, clean_name):
+        """清缓存 → 重载 → 点会话，逼 SDK 重新从 API 拉取，拦它发出的
+        get_by_conversation 请求，从请求体偷 short_id（f8→301→3）。
+
+        请求体的 protobuf 解析是脆弱逆向逻辑，逐字保留自旧实现，勿改。
+        返回 short_id 字符串，偷不到返回 None。
+        """
+        # 1. 清除 SDK 本地缓存（localStorage/sessionStorage/IndexedDB，保留 cookies 以维持登录）
+        print(f"  [*] 清除 SDK 本地缓存...")
+        await self._clear_sdk_cache()
+
+        # 2. 安装请求拦截器（在重新加载之前，确保捕获 SDK 的第一个 API 请求）
+        self._captured_api_cursor = None
+        cursor_captured_event = asyncio.Event()
+
+
+        async def capture_api_request(request):
+            if "get_by_conversation" in request.url and request.method == "POST":
+                try:
+                    body = request.post_data_buffer
+                    if body:
+                        result = await self.page.evaluate("""(bytes) => {
+                            function dv(buf, pos) {
+                                let r = 0n, s = 0n;
+                                while (pos < buf.length) {
+                                    const b = buf[pos++]; r |= BigInt(b & 0x7F) << s;
+                                    if (!(b & 0x80)) break; s += 7n;
                                 }
-                                function ef(buf, tf) {
-                                    let pos = 0;
-                                    while (pos < buf.length) {
-                                        let tag; [tag, pos] = dv(buf, pos);
-                                        const fn = Number(tag >> 3n), wt = Number(tag & 7n);
-                                        if (wt === 0) { let v; [v, pos] = dv(buf, pos); }
-                                        else if (wt === 2) { let len; [len, pos] = dv(buf, pos); len = Number(len); if (fn === tf) return buf.slice(pos, pos + len); pos += len; }
-                                        else if (wt === 1) pos += 8; else if (wt === 5) pos += 4; else break;
-                                    }
-                                    return null;
-                                }
-                                // 提取字符串字段 (wire type 2)
-                                function efStr(buf, tf) {
-                                    let pos = 0;
-                                    while (pos < buf.length) {
-                                        let tag; [tag, pos] = dv(buf, pos);
-                                        const fn = Number(tag >> 3n), wt = Number(tag & 7n);
-                                        if (wt === 0) { let v; [v, pos] = dv(buf, pos); }
-                                        else if (wt === 2) {
-                                            let len; [len, pos] = dv(buf, pos); len = Number(len);
-                                            if (fn === tf) return new TextDecoder().decode(buf.slice(pos, pos + len));
-                                            pos += len;
-                                        }
-                                        else if (wt === 1) pos += 8; else if (wt === 5) pos += 4; else break;
-                                    }
-                                    return null;
-                                }
-                                const data = new Uint8Array(bytes);
-                                const f8 = ef(data, 8);
-                                if (!f8) return null;
-                                const f301 = ef(f8, 301);
-                                if (!f301) return null;
-                                // 提取 conv_id (field 1, string) 和 cursor (field 3, varint)
-                                const reqConvId = efStr(f301, 1);
-                                let cursor = null;
+                                return [r, pos];
+                            }
+                            function ef(buf, tf) {
                                 let pos = 0;
-                                while (pos < f301.length) {
-                                    let tag; [tag, pos] = dv(f301, pos);
+                                while (pos < buf.length) {
+                                    let tag; [tag, pos] = dv(buf, pos);
                                     const fn = Number(tag >> 3n), wt = Number(tag & 7n);
-                                    if (wt === 0) { let v; [v, pos] = dv(f301, pos); if (fn === 3) cursor = v.toString(); }
-                                    else if (wt === 2) { let len; [len, pos] = dv(f301, pos); pos += Number(len); }
+                                    if (wt === 0) { let v; [v, pos] = dv(buf, pos); }
+                                    else if (wt === 2) { let len; [len, pos] = dv(buf, pos); len = Number(len); if (fn === tf) return buf.slice(pos, pos + len); pos += len; }
                                     else if (wt === 1) pos += 8; else if (wt === 5) pos += 4; else break;
                                 }
-                                return { convId: reqConvId, cursor: cursor };
-                            }""", list(body))
-                            if result and result.get("cursor") and result["cursor"] != "0":
-                                req_conv_id = result.get("convId", "")
-                                if req_conv_id == conv_id:
-                                    self._captured_api_cursor = result["cursor"]
-                                    print(f"  [*] 捕获到 API cursor: {result['cursor']} (conv_id 匹配)")
-                                    cursor_captured_event.set()
-                                else:
-                                    print(f"  [!] 忽略不匹配的 API 请求: conv_id={req_conv_id} (期望 {conv_id})")
-                    except Exception:
-                        pass
+                                return null;
+                            }
+                            // 提取字符串字段 (wire type 2)
+                            function efStr(buf, tf) {
+                                let pos = 0;
+                                while (pos < buf.length) {
+                                    let tag; [tag, pos] = dv(buf, pos);
+                                    const fn = Number(tag >> 3n), wt = Number(tag & 7n);
+                                    if (wt === 0) { let v; [v, pos] = dv(buf, pos); }
+                                    else if (wt === 2) {
+                                        let len; [len, pos] = dv(buf, pos); len = Number(len);
+                                        if (fn === tf) return new TextDecoder().decode(buf.slice(pos, pos + len));
+                                        pos += len;
+                                    }
+                                    else if (wt === 1) pos += 8; else if (wt === 5) pos += 4; else break;
+                                }
+                                return null;
+                            }
+                            const data = new Uint8Array(bytes);
+                            const f8 = ef(data, 8);
+                            if (!f8) return null;
+                            const f301 = ef(f8, 301);
+                            if (!f301) return null;
+                            // 提取 conv_id (field 1, string) 和 cursor (field 3, varint)
+                            const reqConvId = efStr(f301, 1);
+                            let cursor = null;
+                            let pos = 0;
+                            while (pos < f301.length) {
+                                let tag; [tag, pos] = dv(f301, pos);
+                                const fn = Number(tag >> 3n), wt = Number(tag & 7n);
+                                if (wt === 0) { let v; [v, pos] = dv(f301, pos); if (fn === 3) cursor = v.toString(); }
+                                else if (wt === 2) { let len; [len, pos] = dv(f301, pos); pos += Number(len); }
+                                else if (wt === 1) pos += 8; else if (wt === 5) pos += 4; else break;
+                            }
+                            return { convId: reqConvId, cursor: cursor };
+                        }""", list(body))
+                        if result and result.get("cursor") and result["cursor"] != "0":
+                            req_conv_id = result.get("convId", "")
+                            if req_conv_id == conv_id:
+                                self._captured_api_cursor = result["cursor"]
+                                print(f"  [*] 捕获到 API cursor: {result['cursor']} (conv_id 匹配)")
+                                cursor_captured_event.set()
+                            else:
+                                print(f"  [!] 忽略不匹配的 API 请求: conv_id={req_conv_id} (期望 {conv_id})")
+                except Exception:
+                    pass
 
-            self.page.on("request", capture_api_request)
 
+        self.page.on("request", capture_api_request)
+        try:
             # 3. 重新加载聊天页面（SDK 内存缓存随页面销毁而清除）
             print(f"  [*] 重新加载聊天页面...")
             await self.page.goto(CHAT_URL, wait_until="domcontentloaded")
@@ -1209,9 +1261,8 @@ class WebChatScraper:
             result = await self._find_and_click_conversation(clean_name)
             if not result.get("found"):
                 dbg = result.get("names", [])
-                print(f"  [!] 重新加载后未找到会话「{clean_name}」，跳过 API 模式 (DOM: {result.get('count', 0)} items: {dbg})")
-                self.page.remove_listener("request", capture_api_request)
-                return
+                print(f"  [!] 重新加载后未找到会话「{clean_name}」 (DOM: {result.get('count', 0)} items: {dbg})")
+                return None
             print(f"  [*] 已重新点击: {result.get('text', '')}")
 
             # 5. 等待 SDK 发出 API 请求（缓存已清，应该很快）
@@ -1219,7 +1270,7 @@ class WebChatScraper:
             try:
                 await asyncio.wait_for(cursor_captured_event.wait(), timeout=15)
             except asyncio.TimeoutError:
-                # 如果 15 秒内没捕获到，尝试轻微滚动触发
+                # 15 秒内没捕获到，尝试轻微滚动触发
                 print(f"  [*] 未立即捕获到，尝试滚动触发...")
                 for i in range(50):
                     await self.page.evaluate("""() => {
@@ -1229,22 +1280,10 @@ class WebChatScraper:
                     await asyncio.sleep(0.3)
                     if self._captured_api_cursor:
                         break
-
+            return self._captured_api_cursor
+        finally:
             self.page.remove_listener("request", capture_api_request)
 
-            if not self._captured_api_cursor:
-                print(f"  [!] 未能捕获 API cursor，回退到滚动模式...")
-                scroll_saved, _ = await self._scroll_up_and_collect(conv_id, incremental=self.incremental)
-                print(f"  [+] 共保存 {scroll_saved} 条消息")
-                return
-
-            # 6. 注入 API 工具 + 直接 API 获取全部消息
-            total_saved = await self._api_fetch_all_messages(
-                conv_id, self._captured_api_cursor, incremental=self.incremental
-            )
-            print(f"  [+] 共保存 {total_saved} 条消息")
-        finally:
-            self._restore_conv_messages_if_empty(conv_id, backed_up)
 
     def _backup_conv_messages(self, conv_id):
         """把该会话的消息快照到临时表，返回条数。
@@ -1586,7 +1625,11 @@ class WebChatScraper:
         }""")
 
     async def _api_fetch_all_messages(self, conv_id, cursor, incremental=False):
-        """用 API 直接获取从 cursor 开始的所有历史消息。cursor 来自滚动阶段捕获。"""
+        """用 API 直接获取全部历史消息。
+
+        `cursor` 是 short_id（imapi 请求 field 3，每会话固定，非分页游标）；真正翻页靠
+        请求 field 5 的时间戳，本方法从 9999999999999999 开始逐批往旧推。
+        """
         await self._inject_api_tools()
 
         api_cursor = cursor
