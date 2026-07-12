@@ -1093,150 +1093,192 @@ class WebChatScraper:
             conv_id = real_conv_id
             print(f"  [*] 真实会话ID: {conv_id}")
 
-        # 全量模式：清除该会话的旧消息，避免残留已撤回或已删除的消息
+        # 全量模式：清除该会话的旧消息，避免残留已撤回或已删除的消息。
+        # 但 DELETE 是先 commit 的，而后面的抓取可能一条都拿不到（回退到滚动模式却读不出
+        # 内容、重新加载后找不到会话、中途抛异常）——那样一次失败的全量抓取就把历史记录
+        # 清空了。所以先快照到临时表，结束时发现库里是空的就还原回去。
+        backed_up = 0
         if not self.incremental:
+            backed_up = self._backup_conv_messages(conv_id)
             cur = self._db_conn.execute("DELETE FROM messages WHERE conv_id = ?", (conv_id,))
             if cur.rowcount > 0:
                 print(f"  [*] 全量模式：已清除该会话旧消息 {cur.rowcount} 条")
 
-        upsert_conversation(self._db_conn, conv_id, name=clean_name)
-        self._db_conn.commit()
-
-        # 从激活的会话列表项抓取并保存会话头像
-        await self._extract_and_save_conv_avatar(conv_id)
-
-        # 提取用户信息（昵称、头像、unique_id）
-        await self._extract_and_save_user_info(conv_id)
-
-        mode_str = "增量" if self.incremental else "全量"
-        print(f"  [*] 开始{mode_str}导出 (纯API模式)...")
-
-        # ── 纯 API 模式：清除 SDK 缓存 → 重新加载 → 捕获 cursor → API 直取全部消息 ──
-
-        # 1. 清除 SDK 本地缓存（localStorage/sessionStorage/IndexedDB，保留 cookies 以维持登录）
-        print(f"  [*] 清除 SDK 本地缓存...")
-        await self._clear_sdk_cache()
-
-        # 2. 安装请求拦截器（在重新加载之前，确保捕获 SDK 的第一个 API 请求）
-        self._captured_api_cursor = None
-        cursor_captured_event = asyncio.Event()
-
-        async def capture_api_request(request):
-            if "get_by_conversation" in request.url and request.method == "POST":
-                try:
-                    body = request.post_data_buffer
-                    if body:
-                        result = await self.page.evaluate("""(bytes) => {
-                            function dv(buf, pos) {
-                                let r = 0n, s = 0n;
-                                while (pos < buf.length) {
-                                    const b = buf[pos++]; r |= BigInt(b & 0x7F) << s;
-                                    if (!(b & 0x80)) break; s += 7n;
-                                }
-                                return [r, pos];
-                            }
-                            function ef(buf, tf) {
-                                let pos = 0;
-                                while (pos < buf.length) {
-                                    let tag; [tag, pos] = dv(buf, pos);
-                                    const fn = Number(tag >> 3n), wt = Number(tag & 7n);
-                                    if (wt === 0) { let v; [v, pos] = dv(buf, pos); }
-                                    else if (wt === 2) { let len; [len, pos] = dv(buf, pos); len = Number(len); if (fn === tf) return buf.slice(pos, pos + len); pos += len; }
-                                    else if (wt === 1) pos += 8; else if (wt === 5) pos += 4; else break;
-                                }
-                                return null;
-                            }
-                            // 提取字符串字段 (wire type 2)
-                            function efStr(buf, tf) {
-                                let pos = 0;
-                                while (pos < buf.length) {
-                                    let tag; [tag, pos] = dv(buf, pos);
-                                    const fn = Number(tag >> 3n), wt = Number(tag & 7n);
-                                    if (wt === 0) { let v; [v, pos] = dv(buf, pos); }
-                                    else if (wt === 2) {
-                                        let len; [len, pos] = dv(buf, pos); len = Number(len);
-                                        if (fn === tf) return new TextDecoder().decode(buf.slice(pos, pos + len));
-                                        pos += len;
-                                    }
-                                    else if (wt === 1) pos += 8; else if (wt === 5) pos += 4; else break;
-                                }
-                                return null;
-                            }
-                            const data = new Uint8Array(bytes);
-                            const f8 = ef(data, 8);
-                            if (!f8) return null;
-                            const f301 = ef(f8, 301);
-                            if (!f301) return null;
-                            // 提取 conv_id (field 1, string) 和 cursor (field 3, varint)
-                            const reqConvId = efStr(f301, 1);
-                            let cursor = null;
-                            let pos = 0;
-                            while (pos < f301.length) {
-                                let tag; [tag, pos] = dv(f301, pos);
-                                const fn = Number(tag >> 3n), wt = Number(tag & 7n);
-                                if (wt === 0) { let v; [v, pos] = dv(f301, pos); if (fn === 3) cursor = v.toString(); }
-                                else if (wt === 2) { let len; [len, pos] = dv(f301, pos); pos += Number(len); }
-                                else if (wt === 1) pos += 8; else if (wt === 5) pos += 4; else break;
-                            }
-                            return { convId: reqConvId, cursor: cursor };
-                        }""", list(body))
-                        if result and result.get("cursor") and result["cursor"] != "0":
-                            req_conv_id = result.get("convId", "")
-                            if req_conv_id == conv_id:
-                                self._captured_api_cursor = result["cursor"]
-                                print(f"  [*] 捕获到 API cursor: {result['cursor']} (conv_id 匹配)")
-                                cursor_captured_event.set()
-                            else:
-                                print(f"  [!] 忽略不匹配的 API 请求: conv_id={req_conv_id} (期望 {conv_id})")
-                except Exception:
-                    pass
-
-        self.page.on("request", capture_api_request)
-
-        # 3. 重新加载聊天页面（SDK 内存缓存随页面销毁而清除）
-        print(f"  [*] 重新加载聊天页面...")
-        await self.page.goto(CHAT_URL, wait_until="domcontentloaded")
-        await self._ensure_conv_list_loaded()
-
-        # 4. 重新点击目标会话（触发 SDK 从 API 加载消息）
-        print(f"  [*] 重新点击会话: {clean_name}...")
-        result = await self._find_and_click_conversation(clean_name)
-        if not result.get("found"):
-            dbg = result.get("names", [])
-            print(f"  [!] 重新加载后未找到会话「{clean_name}」，跳过 API 模式 (DOM: {result.get('count', 0)} items: {dbg})")
-            self.page.remove_listener("request", capture_api_request)
-            return
-        print(f"  [*] 已重新点击: {result.get('text', '')}")
-
-        # 5. 等待 SDK 发出 API 请求（缓存已清，应该很快）
-        print(f"  [*] 等待 SDK 发出 API 请求...")
         try:
-            await asyncio.wait_for(cursor_captured_event.wait(), timeout=15)
-        except asyncio.TimeoutError:
-            # 如果 15 秒内没捕获到，尝试轻微滚动触发
-            print(f"  [*] 未立即捕获到，尝试滚动触发...")
-            for i in range(50):
-                await self.page.evaluate("""() => {
-                    const el = document.querySelector('[class*="messageMessageListlist"]');
-                    if (el) el.scrollTop += 3000;
-                }""")
-                await asyncio.sleep(0.3)
-                if self._captured_api_cursor:
-                    break
+            upsert_conversation(self._db_conn, conv_id, name=clean_name)
+            self._db_conn.commit()
 
-        self.page.remove_listener("request", capture_api_request)
+            # 从激活的会话列表项抓取并保存会话头像
+            await self._extract_and_save_conv_avatar(conv_id)
 
-        if not self._captured_api_cursor:
-            print(f"  [!] 未能捕获 API cursor，回退到滚动模式...")
-            scroll_saved, _ = await self._scroll_up_and_collect(conv_id, incremental=self.incremental)
-            print(f"  [+] 共保存 {scroll_saved} 条消息")
-            return
+            # 提取用户信息（昵称、头像、unique_id）
+            await self._extract_and_save_user_info(conv_id)
 
-        # 6. 注入 API 工具 + 直接 API 获取全部消息
-        total_saved = await self._api_fetch_all_messages(
-            conv_id, self._captured_api_cursor, incremental=self.incremental
+            mode_str = "增量" if self.incremental else "全量"
+            print(f"  [*] 开始{mode_str}导出 (纯API模式)...")
+
+            # ── 纯 API 模式：清除 SDK 缓存 → 重新加载 → 捕获 cursor → API 直取全部消息 ──
+
+            # 1. 清除 SDK 本地缓存（localStorage/sessionStorage/IndexedDB，保留 cookies 以维持登录）
+            print(f"  [*] 清除 SDK 本地缓存...")
+            await self._clear_sdk_cache()
+
+            # 2. 安装请求拦截器（在重新加载之前，确保捕获 SDK 的第一个 API 请求）
+            self._captured_api_cursor = None
+            cursor_captured_event = asyncio.Event()
+
+            async def capture_api_request(request):
+                if "get_by_conversation" in request.url and request.method == "POST":
+                    try:
+                        body = request.post_data_buffer
+                        if body:
+                            result = await self.page.evaluate("""(bytes) => {
+                                function dv(buf, pos) {
+                                    let r = 0n, s = 0n;
+                                    while (pos < buf.length) {
+                                        const b = buf[pos++]; r |= BigInt(b & 0x7F) << s;
+                                        if (!(b & 0x80)) break; s += 7n;
+                                    }
+                                    return [r, pos];
+                                }
+                                function ef(buf, tf) {
+                                    let pos = 0;
+                                    while (pos < buf.length) {
+                                        let tag; [tag, pos] = dv(buf, pos);
+                                        const fn = Number(tag >> 3n), wt = Number(tag & 7n);
+                                        if (wt === 0) { let v; [v, pos] = dv(buf, pos); }
+                                        else if (wt === 2) { let len; [len, pos] = dv(buf, pos); len = Number(len); if (fn === tf) return buf.slice(pos, pos + len); pos += len; }
+                                        else if (wt === 1) pos += 8; else if (wt === 5) pos += 4; else break;
+                                    }
+                                    return null;
+                                }
+                                // 提取字符串字段 (wire type 2)
+                                function efStr(buf, tf) {
+                                    let pos = 0;
+                                    while (pos < buf.length) {
+                                        let tag; [tag, pos] = dv(buf, pos);
+                                        const fn = Number(tag >> 3n), wt = Number(tag & 7n);
+                                        if (wt === 0) { let v; [v, pos] = dv(buf, pos); }
+                                        else if (wt === 2) {
+                                            let len; [len, pos] = dv(buf, pos); len = Number(len);
+                                            if (fn === tf) return new TextDecoder().decode(buf.slice(pos, pos + len));
+                                            pos += len;
+                                        }
+                                        else if (wt === 1) pos += 8; else if (wt === 5) pos += 4; else break;
+                                    }
+                                    return null;
+                                }
+                                const data = new Uint8Array(bytes);
+                                const f8 = ef(data, 8);
+                                if (!f8) return null;
+                                const f301 = ef(f8, 301);
+                                if (!f301) return null;
+                                // 提取 conv_id (field 1, string) 和 cursor (field 3, varint)
+                                const reqConvId = efStr(f301, 1);
+                                let cursor = null;
+                                let pos = 0;
+                                while (pos < f301.length) {
+                                    let tag; [tag, pos] = dv(f301, pos);
+                                    const fn = Number(tag >> 3n), wt = Number(tag & 7n);
+                                    if (wt === 0) { let v; [v, pos] = dv(f301, pos); if (fn === 3) cursor = v.toString(); }
+                                    else if (wt === 2) { let len; [len, pos] = dv(f301, pos); pos += Number(len); }
+                                    else if (wt === 1) pos += 8; else if (wt === 5) pos += 4; else break;
+                                }
+                                return { convId: reqConvId, cursor: cursor };
+                            }""", list(body))
+                            if result and result.get("cursor") and result["cursor"] != "0":
+                                req_conv_id = result.get("convId", "")
+                                if req_conv_id == conv_id:
+                                    self._captured_api_cursor = result["cursor"]
+                                    print(f"  [*] 捕获到 API cursor: {result['cursor']} (conv_id 匹配)")
+                                    cursor_captured_event.set()
+                                else:
+                                    print(f"  [!] 忽略不匹配的 API 请求: conv_id={req_conv_id} (期望 {conv_id})")
+                    except Exception:
+                        pass
+
+            self.page.on("request", capture_api_request)
+
+            # 3. 重新加载聊天页面（SDK 内存缓存随页面销毁而清除）
+            print(f"  [*] 重新加载聊天页面...")
+            await self.page.goto(CHAT_URL, wait_until="domcontentloaded")
+            await self._ensure_conv_list_loaded()
+
+            # 4. 重新点击目标会话（触发 SDK 从 API 加载消息）
+            print(f"  [*] 重新点击会话: {clean_name}...")
+            result = await self._find_and_click_conversation(clean_name)
+            if not result.get("found"):
+                dbg = result.get("names", [])
+                print(f"  [!] 重新加载后未找到会话「{clean_name}」，跳过 API 模式 (DOM: {result.get('count', 0)} items: {dbg})")
+                self.page.remove_listener("request", capture_api_request)
+                return
+            print(f"  [*] 已重新点击: {result.get('text', '')}")
+
+            # 5. 等待 SDK 发出 API 请求（缓存已清，应该很快）
+            print(f"  [*] 等待 SDK 发出 API 请求...")
+            try:
+                await asyncio.wait_for(cursor_captured_event.wait(), timeout=15)
+            except asyncio.TimeoutError:
+                # 如果 15 秒内没捕获到，尝试轻微滚动触发
+                print(f"  [*] 未立即捕获到，尝试滚动触发...")
+                for i in range(50):
+                    await self.page.evaluate("""() => {
+                        const el = document.querySelector('[class*="messageMessageListlist"]');
+                        if (el) el.scrollTop += 3000;
+                    }""")
+                    await asyncio.sleep(0.3)
+                    if self._captured_api_cursor:
+                        break
+
+            self.page.remove_listener("request", capture_api_request)
+
+            if not self._captured_api_cursor:
+                print(f"  [!] 未能捕获 API cursor，回退到滚动模式...")
+                scroll_saved, _ = await self._scroll_up_and_collect(conv_id, incremental=self.incremental)
+                print(f"  [+] 共保存 {scroll_saved} 条消息")
+                return
+
+            # 6. 注入 API 工具 + 直接 API 获取全部消息
+            total_saved = await self._api_fetch_all_messages(
+                conv_id, self._captured_api_cursor, incremental=self.incremental
+            )
+            print(f"  [+] 共保存 {total_saved} 条消息")
+        finally:
+            self._restore_conv_messages_if_empty(conv_id, backed_up)
+
+    def _backup_conv_messages(self, conv_id):
+        """把该会话的消息快照到临时表，返回条数。
+
+        TEMP 表跟随连接存在，不受中途 commit 影响，正好用来兜住"全量抓取先删后抓"
+        的窗口期。
+        """
+        conn = self._db_conn
+        conn.execute("DROP TABLE IF EXISTS temp.msg_backup")
+        conn.execute(
+            "CREATE TEMP TABLE msg_backup AS SELECT * FROM messages WHERE conv_id = ?",
+            (conv_id,),
         )
-        print(f"  [+] 共保存 {total_saved} 条消息")
+        return conn.execute("SELECT COUNT(*) FROM temp.msg_backup").fetchone()[0]
+
+    def _restore_conv_messages_if_empty(self, conv_id, backed_up):
+        """全量抓取一条都没入库时，把快照的旧消息放回去。
+
+        一个会话在抖音那边真的被清空、导致抓到 0 条的概率，远低于抓取本身出问题。
+        宁可留着旧记录（要清空有面板的删除功能），也不能让一次失败的抓取把历史抹掉。
+        """
+        if not backed_up:
+            return
+        conn = self._db_conn
+        remaining = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE conv_id = ?", (conv_id,)
+        ).fetchone()[0]
+        if remaining == 0:
+            conn.execute("INSERT INTO messages SELECT * FROM temp.msg_backup")
+            update_conversation_stats(conn, conv_id)
+            print(f"  [!] 本次全量抓取一条消息都没拿到，已还原原有的 {backed_up} 条旧消息")
+        conn.execute("DROP TABLE IF EXISTS temp.msg_backup")
+        conn.commit()
+
 
     async def _clear_sdk_cache(self):
         """清除 IM SDK 的本地缓存（localStorage/sessionStorage/IndexedDB），保留 cookies。
